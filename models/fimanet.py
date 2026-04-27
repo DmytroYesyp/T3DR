@@ -37,11 +37,13 @@ class TemporalSSMBlock(nn.Module):
 
 class FiMANet(nn.Module):
     def __init__(self, seq_len=10, hidden_size=256, num_layers=2,
-                 use_imu=False, imu_channels=6, output_dim=1):
+                 use_imu=False, imu_channels=6, output_dim=1,
+                 predict_uncertainty=False):
         super().__init__()
         self.seq_len = seq_len
         self.use_imu = use_imu
         self.output_dim = output_dim
+        self.predict_uncertainty = predict_uncertainty
 
         # Backbone (ResNet-18)
         base_resnet = models.resnet18(weights='IMAGENET1K_V1')
@@ -90,11 +92,12 @@ class FiMANet(nn.Module):
             TemporalSSMBlock(d_model=hidden_size) for _ in range(num_layers)
         ])
 
+        head_out = output_dim * 2 if predict_uncertainty else output_dim
         self.head = nn.Sequential(
             nn.Linear(hidden_size, 64),
             nn.ReLU(),
             nn.Dropout(0.3),
-            nn.Linear(64, output_dim)
+            nn.Linear(64, head_out)
         )
 
     def forward(self, x, imu=None):
@@ -129,5 +132,12 @@ class FiMANet(nn.Module):
         for layer in self.temporal_layers:
             features = layer(features)
 
-        out = self.head(features[:, -1, :])  # [B, output_dim]
+        out = self.head(features[:, -1, :])
+        if self.predict_uncertainty:
+            mu = out[..., :self.output_dim]
+            log_var = out[..., self.output_dim:]
+            if self.output_dim == 1:
+                mu = mu.squeeze(-1)
+                log_var = log_var.squeeze(-1)
+            return mu, log_var
         return out.squeeze(-1) if self.output_dim == 1 else out

@@ -1,8 +1,3 @@
-"""
-End-to-end script: trains FiMA-Net (visual-only) and then evaluates it
-with the IMU verifier enabled. All artifacts share a single versioned tag.
-"""
-
 import os
 os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 
@@ -16,7 +11,7 @@ import torch.nn as nn
 import numpy as np
 import matplotlib.pyplot as plt
 from collections import OrderedDict
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, ConcatDataset
 from torch.amp import autocast, GradScaler
 from datetime import datetime
 
@@ -31,7 +26,7 @@ from lib.imu_verifier import IMUVerifier
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 SEQ_LEN = 20
 BATCH_SIZE = 64
-EPOCHS = 10
+EPOCHS = 6
 
 # In-model IMU fusion is OFF — IMU lives outside as a verifier (see below).
 USE_IMU = False
@@ -39,15 +34,14 @@ WARMUP_EPOCHS = 2  # freeze layer2/3/4 for this many epochs
 
 # Eval-time IMU verifier settings
 USE_IMU_VERIFIER = True
-FUSION_ALPHA = 0.9  # heavy weight on vision; IMU only nudges outliers
+PREDICT_UNCERTAINTY = True  # heteroscedastic head feeds σ to the ESKF as measurement noise
 
 BASE_DATA_DIR = "/home/123ghdh/datasets"
 TRAIN_FOLDERS = [os.path.join(BASE_DATA_DIR, str(i).zfill(3)) for i in range(50)]
 
-VAL_FRAMES_PATH = os.path.join(BASE_DATA_DIR, 'valDataset/data/frames/050/LH_Par_C_DtP.h5')
-VAL_TFORMS_PATH = os.path.join(BASE_DATA_DIR, 'valDataset/data/transfs/050/LH_Par_C_DtP.h5')
-
-VAL_START, VAL_END = 50, 400  # for the subject-050 detailed analysis
+VAL_FRAMES_ROOT = os.path.join(BASE_DATA_DIR, 'valDataset/data/frames')
+VAL_TFORMS_ROOT = os.path.join(BASE_DATA_DIR, 'valDataset/data/transfs')
+VAL_LAST_N = 10  # validation = last N (frames, tforms) pairs sorted by subject/scan
 
 # =============================================================================
 # UTILITIES
@@ -67,6 +61,26 @@ def set_backbone_trainable(model, trainable):
     for name in ['layer2', 'layer3', 'layer4']:
         for p in getattr(model, name).parameters():
             p.requires_grad = trainable
+
+def collect_last_n_val_files(n=VAL_LAST_N):
+    """Last n (frames_path, tforms_path, case_name) triples from VAL_FRAMES_ROOT,
+    sorted by subject then filename. Tolerant of missing tform pairs and a
+    flat (no-subject-subdir) layout.
+    """
+    pairs = []
+    if not os.path.isdir(VAL_FRAMES_ROOT):
+        return pairs
+    for subj in sorted(os.listdir(VAL_FRAMES_ROOT)):
+        sd = os.path.join(VAL_FRAMES_ROOT, subj)
+        if not os.path.isdir(sd):
+            continue
+        for fname in sorted(os.listdir(sd)):
+            if not fname.endswith('.h5'):
+                continue
+            tpath = os.path.join(VAL_TFORMS_ROOT, subj, fname)
+            if os.path.exists(tpath):
+                pairs.append((os.path.join(sd, fname), tpath, f"{subj}/{fname}"))
+    return pairs[-n:]
 
 def load_weights_safe(model, path):
     print(f"[{get_time()}] Loading weights from {path}...")
@@ -95,6 +109,26 @@ class MotionWeightedL1Loss(nn.Module):
         weight = 1.0 + self.alpha * target
         weighted_loss = base_loss * weight
         return torch.mean(weighted_loss)
+
+
+class MotionWeightedHeteroscedasticLoss(nn.Module):
+    """Gaussian NLL on (μ, log σ²) with the same motion-weighted prior.
+    Lets the network predict its own per-frame σ — the ESKF reads σ as
+    measurement noise so the filter trusts confident frames more.
+    """
+    def __init__(self, alpha=2.0, log_var_min=-6.0, log_var_max=6.0):
+        super().__init__()
+        self.alpha = alpha
+        self.log_var_min = log_var_min
+        self.log_var_max = log_var_max
+
+    def forward(self, mu, log_var, target):
+        log_var = torch.clamp(log_var, self.log_var_min, self.log_var_max)
+        sq_err = (target - mu) ** 2
+        nll = 0.5 * torch.exp(-log_var) * sq_err + 0.5 * log_var
+        weight = 1.0 + self.alpha * target
+        return torch.mean(weight * nll)
+
 
 # =============================================================================
 # DATASETS
@@ -233,7 +267,7 @@ def train_model(run_name, model_name, model, train_loader, val_loader, epochs, u
     # patience=3 so the scheduler doesn't drop LR on a single noisy val epoch
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=3)
 
-    criterion = MotionWeightedL1Loss(alpha=2.0)
+    criterion = MotionWeightedHeteroscedasticLoss(alpha=2.0) if PREDICT_UNCERTAINTY else MotionWeightedL1Loss(alpha=2.0)
     scaler = GradScaler('cuda')
 
     history = {'train': [], 'val': []}
@@ -261,7 +295,11 @@ def train_model(run_name, model_name, model, train_loader, val_loader, epochs, u
             optimizer.zero_grad()
             with autocast(device_type='cuda', dtype=torch.float16):
                 outputs = model(seqs, imu=imus)
-                loss = criterion(outputs, targets)
+                if PREDICT_UNCERTAINTY:
+                    mu, log_var = outputs
+                    loss = criterion(mu, log_var, targets)
+                else:
+                    loss = criterion(outputs, targets)
 
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
@@ -293,9 +331,14 @@ def train_model(run_name, model_name, model, train_loader, val_loader, epochs, u
 
                 with autocast(device_type='cuda', dtype=torch.float16):
                     outputs = model(seqs, imu=imus)
-                    v_loss = criterion(outputs, targets)
+                    if PREDICT_UNCERTAINTY:
+                        mu, log_var = outputs
+                        v_loss = criterion(mu, log_var, targets)
+                        v_mae = pure_l1(mu, targets)
+                    else:
+                        v_loss = criterion(outputs, targets)
+                        v_mae = pure_l1(outputs, targets)
                     val_loss += v_loss.item()
-                    v_mae = pure_l1(outputs, targets)
                     val_mae_sum += v_mae.item()
 
         avg_val = val_loss / len(val_loader)
@@ -341,11 +384,19 @@ def predict_z_trajectory(model, frames, tforms, imu_verifier, start_idx=0, end_i
     if end_idx is None: end_idx = len(frames)
     if end_idx - start_idx <= SEQ_LEN: return None, None
 
-    curr_z_pred = tforms[start_idx + SEQ_LEN - 1, 2, 3]
-    curr_z_real = tforms[start_idx + SEQ_LEN - 1, 2, 3]
+    curr_z_pred = float(tforms[start_idx + SEQ_LEN - 1, 2, 3])
+    curr_z_real = float(tforms[start_idx + SEQ_LEN - 1, 2, 3])
 
     traj_pred = [curr_z_pred]
     traj_real = [curr_z_real]
+
+    if imu_verifier is not None:
+        imu_full = imu_verifier.precompute_imu(tforms)
+        init_pos = np.array([0.0, 0.0, curr_z_pred], dtype=np.float64)
+        init_rot = tforms[start_idx + SEQ_LEN - 1, :3, :3].astype(np.float64)
+        imu_verifier.reset(init_pos, init_rot)
+
+    use_uncertainty = getattr(model, 'predict_uncertainty', False)
 
     with torch.no_grad():
         for t in range(start_idx, end_idx - SEQ_LEN):
@@ -358,19 +409,29 @@ def predict_z_trajectory(model, frames, tforms, imu_verifier, start_idx=0, end_i
 
             inp = torch.tensor(np.stack(seq_imgs), dtype=torch.float32).unsqueeze(0).to(DEVICE)
 
-            z_visual = model(inp).item()
-
-            if imu_verifier is not None:
-                tforms_seq = tforms[t : t + SEQ_LEN + 1]
-                z_imu = imu_verifier.estimate_step_magnitude(tforms_seq)
-                step_mag = imu_verifier.fuse(z_visual, z_imu, alpha=FUSION_ALPHA)
+            out = model(inp)
+            if use_uncertainty:
+                mu_t, log_var_t = out
+                z_visual = float(mu_t.item())
+                sigma_visual = float(torch.exp(0.5 * log_var_t).item())
             else:
-                step_mag = z_visual
+                z_visual = float(out.item())
+                sigma_visual = None
 
             real_step = tforms[t + SEQ_LEN, 2, 3] - tforms[t + SEQ_LEN - 1, 2, 3]
-            direction = np.sign(real_step) if real_step != 0 else 1
 
-            curr_z_pred += (step_mag * direction)
+            if imu_verifier is not None:
+                idx = t + SEQ_LEN - 1
+                accel = imu_full[idx, :3]
+                gyro  = imu_full[idx, 3:]
+                signed_step = imu_verifier.step(accel, gyro, z_visual, sigma_visual)
+                curr_z_pred += signed_step
+            else:
+                # Visual-only: model predicts magnitude, sign comes from GT (a known
+                # leak that the ESKF removes — keep visual-only path for ablation).
+                direction = np.sign(real_step) if real_step != 0 else 1
+                curr_z_pred += z_visual * direction
+
             curr_z_real += real_step
 
             traj_pred.append(curr_z_pred)
@@ -428,56 +489,73 @@ def plot_z_trajectory(z_pred, z_real, title, filename, using_imu):
     plt.close()
     print(f"[{get_time()}] Saved Z-plot: {filename}")
 
-def run_evaluation(run_name, model, imu_verifier):
+def run_evaluation(run_name, model, imu_verifier, val_pairs):
     print(f"\n{'='*50}")
     print(f"[{get_time()}] EVALUATION PHASE")
-    print(f"[{get_time()}] IMU Verifier: {'ENABLED (alpha=' + str(FUSION_ALPHA) + ')' if imu_verifier else 'DISABLED'}")
+    print(f"[{get_time()}] IMU Verifier: {'ENABLED (ESKF)' if imu_verifier else 'DISABLED'}")
     print(f"{'='*50}")
 
-    # ---------- PART 1: Subject 050 detailed analysis ----------
-    print(f"\n[{get_time()}] PART 1: Subject 050 detailed analysis")
-    with h5py.File(VAL_FRAMES_PATH, 'r') as f_f, h5py.File(VAL_TFORMS_PATH, 'r') as f_t:
-        val_frames = f_f['frames'][:]
-        val_tforms = f_t['tforms'][:]
+    # ---------- PART 1: Per-case validation analysis ----------
+    print(f"\n[{get_time()}] PART 1: Per-case validation ({len(val_pairs)} cases)")
+    val_results = []
+    for frames_path, tforms_path, case_name in val_pairs:
+        try:
+            with h5py.File(frames_path, 'r') as f_f, h5py.File(tforms_path, 'r') as f_t:
+                v_frames = f_f['frames'][:]
+                v_tforms = f_t['tforms'][:]
+            z_pred, z_real = predict_z_trajectory(model, v_frames, v_tforms, imu_verifier)
+            if z_pred is None:
+                continue
+            mae, drift, length, fdr = calculate_metrics(z_pred, z_real)
+            val_results.append({
+                'name': case_name, 'z_pred': z_pred, 'z_real': z_real,
+                'mae': mae, 'drift': drift, 'length': length, 'fdr': fdr,
+            })
+            print(f"[{get_time()}]   {case_name}: MAE={mae:.2f}mm | FDR={fdr:.2f}%")
+        except Exception as e:
+            print(f"[{get_time()}]   ERROR on {case_name}: {e}")
 
-    z_pred, z_real = predict_z_trajectory(model, val_frames, val_tforms, imu_verifier,
-                                          start_idx=VAL_START, end_idx=VAL_END)
-    v_mae, v_drift, v_len, v_fdr = calculate_metrics(z_pred, z_real)
-    print(f"[{get_time()}] Validation -> MAE: {v_mae:.2f}mm | Drift: {v_drift:.2f}mm | FDR: {v_fdr:.2f}%")
-    plot_z_trajectory(
-        z_pred, z_real,
-        f"Validation Z-Axis (Subject 050)\nFDR: {v_fdr:.2f}% | MAE: {v_mae:.2f}mm",
-        f"{run_name}_val050_z.png",
-        using_imu=imu_verifier is not None,
-    )
+    # Per-case Z plots
+    for i, r in enumerate(val_results):
+        safe = r['name'].replace('/', '_').replace('.h5', '')
+        plot_z_trajectory(
+            r['z_pred'], r['z_real'],
+            f"Validation: {r['name']}\nFDR: {r['fdr']:.2f}% | MAE: {r['mae']:.2f}mm",
+            f"{run_name}_val_{i:02d}_{safe}.png",
+            using_imu=imu_verifier is not None,
+        )
 
-    # 3D reconstruction plot
-    path_2d_px = calculate_visual_odometry_2d(val_frames[VAL_START + SEQ_LEN - 1 : VAL_END])
-    real_xy_mm = val_tforms[VAL_START + SEQ_LEN - 1 : VAL_END, :2, 3]
-    real_xy_mm -= real_xy_mm[0]
+    # Single grid plot showing all validation trajectories at once
+    val_avg_mae = float('nan'); val_avg_drift = float('nan'); val_avg_fdr = float('nan')
+    if val_results:
+        n = len(val_results)
+        cols = 2
+        rows = int(np.ceil(n / cols))
+        fig, axes = plt.subplots(rows, cols, figsize=(cols * 7, rows * 3.0))
+        axes = np.atleast_1d(axes).flatten()
+        for i, r in enumerate(val_results):
+            ax = axes[i]
+            zr = r['z_real'] - r['z_real'][0]
+            zp = r['z_pred'] - r['z_pred'][0]
+            ax.plot(zr, 'g-', linewidth=2, alpha=0.6, label='GT')
+            ax.plot(zp, 'r--', linewidth=1.5, label='Pred')
+            ax.set_title(f"{r['name']} | MAE: {r['mae']:.2f}mm | FDR: {r['fdr']:.2f}%", fontsize=9)
+            ax.grid(True, alpha=0.3)
+            ax.set_xlabel("Frame", fontsize=8)
+            ax.set_ylabel("Δz (mm)", fontsize=8)
+            if i == 0: ax.legend(fontsize=8, loc='best')
+        for j in range(n, len(axes)):
+            axes[j].axis('off')
+        fig.suptitle(f"{run_name} — Validation Z-trajectories ({n} cases)", fontsize=12)
+        plt.tight_layout()
+        plt.savefig(f"{run_name}_val_grid.png", dpi=200, bbox_inches='tight')
+        plt.close()
+        print(f"[{get_time()}] Saved validation grid: {run_name}_val_grid.png")
 
-    affine_mat, _ = cv2.estimateAffine2D(path_2d_px.astype(np.float32), real_xy_mm.astype(np.float32))
-    path_2d_aug = np.column_stack([path_2d_px, np.ones(len(path_2d_px))])
-    pred_xy_mm = path_2d_aug @ affine_mat.T
-
-    pred_3d = np.column_stack([pred_xy_mm, z_pred - z_pred[0]])
-    real_3d = np.column_stack([real_xy_mm, z_real - z_real[0]])
-
-    fig = plt.figure(figsize=(10, 8))
-    ax = fig.add_subplot(111, projection='3d')
-    ax.plot(real_3d[:,0], real_3d[:,1], real_3d[:,2], 'g-', linewidth=3, alpha=0.5, label='Ground Truth 3D Path')
-    ax.plot(pred_3d[:,0], pred_3d[:,1], pred_3d[:,2], 'r--', linewidth=2, label='FiMA Reconstruction')
-    ax.scatter(0, 0, 0, c='cyan', s=100, label='Start')
-    ax.scatter(real_3d[-1,0], real_3d[-1,1], real_3d[-1,2], c='green', marker='x', s=100)
-    ax.scatter(pred_3d[-1,0], pred_3d[-1,1], pred_3d[-1,2], c='red', marker='x', s=100)
-    ax.set_title("Full 3D Probe Trajectory (Subject 050)")
-    ax.set_xlabel("X (mm)"); ax.set_ylabel("Y (mm)"); ax.set_zlabel("Z (mm)")
-    ax.legend()
-    try: ax.set_box_aspect([1,1,1])
-    except: pass
-    plt.savefig(f"{run_name}_val050_3d.png", dpi=300, bbox_inches='tight')
-    plt.close()
-    print(f"[{get_time()}] Saved 3D-plot: {run_name}_val050_3d.png")
+        val_avg_mae   = float(np.mean([r['mae']   for r in val_results]))
+        val_avg_drift = float(np.mean([r['drift'] for r in val_results]))
+        val_avg_fdr   = float(np.mean([r['fdr']   for r in val_results]))
+        print(f"[{get_time()}] Validation avg -> MAE: {val_avg_mae:.2f}mm | Drift: {val_avg_drift:.2f}mm | FDR: {val_avg_fdr:.2f}%")
 
     # ---------- PART 2: Global dataset evaluation ----------
     print(f"\n[{get_time()}] PART 2: Global dataset evaluation")
@@ -533,11 +611,16 @@ def run_evaluation(run_name, model, imu_verifier):
     avg_fdr = np.mean(all_metrics['fdr']) if total_scans > 0 else float('nan')
 
     summary_text = (
-        f"=== GLOBAL DATASET METRICS (FiMA-Net) ===\n"
+        f"=== EVALUATION METRICS (FiMA-Net) ===\n"
         f"Run tag:             {run_name}\n"
-        f"IMU Verifier:        {'ENABLED (alpha=' + str(FUSION_ALPHA) + ')' if imu_verifier else 'DISABLED'}\n"
-        f"Subject 050 MAE:     {v_mae:.3f} mm\n"
-        f"Subject 050 FDR:     {v_fdr:.2f} %\n"
+        f"IMU Verifier:        {'ENABLED (ESKF)' if imu_verifier else 'DISABLED'}\n"
+        f"\n"
+        f"--- Validation set ({len(val_results)} cases) ---\n"
+        f"Validation MAE:      {val_avg_mae:.3f} mm (avg)\n"
+        f"Validation Drift:    {val_avg_drift:.3f} mm (avg)\n"
+        f"Validation FDR:      {val_avg_fdr:.2f} % (avg)\n"
+        f"\n"
+        f"--- Global dataset (all training scans re-eval) ---\n"
         f"Total valid scans:   {total_scans}\n"
         f"Average MAE:         {avg_mae:.3f} mm\n"
         f"Average Final Drift: {avg_drift:.3f} mm\n"
@@ -582,32 +665,43 @@ if __name__ == '__main__':
     train_ds = LargeUSDataset(TRAIN_FOLDERS, seq_len=SEQ_LEN, use_imu=USE_IMU)
     train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=0)
 
-    val_ds = MemoryUSDataset(VAL_FRAMES_PATH, VAL_TFORMS_PATH, seq_len=SEQ_LEN, use_imu=USE_IMU)
+    val_pairs = collect_last_n_val_files(VAL_LAST_N)
+    print(f"[{get_time()}] Validation set: {len(val_pairs)} cases")
+    val_datasets = [
+        MemoryUSDataset(fp, tp, seq_len=SEQ_LEN, use_imu=USE_IMU)
+        for fp, tp, _ in val_pairs
+    ]
+    val_ds = ConcatDataset(val_datasets)
     val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False)
 
     # Single shared versioned tag for training + evaluation artifacts.
-    base_tag = f"fima_seq{SEQ_LEN}_e{EPOCHS}{'_imufused' if USE_IMU else ''}"
+    base_tag = (
+        f"fima_seq{SEQ_LEN}_e{EPOCHS}"
+        f"{'_imufused' if USE_IMU else ''}"
+        f"{'_eskf' if USE_IMU_VERIFIER else ''}"
+        f"{'_unc' if PREDICT_UNCERTAINTY else ''}"
+    )
     run_name = next_run_name(base_tag)
     print(f"[{get_time()}] Run tag: {run_name}")
 
     print(f"[{get_time()}] --- STEP 2: TRAIN FIMA-NET ---")
-    fima_model = FiMANet(seq_len=SEQ_LEN, use_imu=USE_IMU)
+    fima_model = FiMANet(seq_len=SEQ_LEN, use_imu=USE_IMU, predict_uncertainty=PREDICT_UNCERTAINTY)
     fima_history, best_model_path = train_model(
         run_name, "FiMA_UnfrozenBackbone", fima_model, train_loader, val_loader, EPOCHS, use_imu=USE_IMU
     )
 
     # Free training resources before eval
-    del train_loader, train_ds, val_loader, val_ds
+    del train_loader, train_ds, val_loader, val_ds, val_datasets
     gc.collect()
     torch.cuda.empty_cache()
 
     print(f"[{get_time()}] --- STEP 3: EVALUATE WITH IMU VERIFIER ---")
     # Reload best checkpoint into a fresh model in eval mode
-    eval_model = FiMANet(seq_len=SEQ_LEN, use_imu=USE_IMU).to(DEVICE)
+    eval_model = FiMANet(seq_len=SEQ_LEN, use_imu=USE_IMU, predict_uncertainty=PREDICT_UNCERTAINTY).to(DEVICE)
     eval_model = load_weights_safe(eval_model, best_model_path)
 
     imu_verifier = IMUVerifier(IMUSimulator()) if USE_IMU_VERIFIER else None
-    run_evaluation(run_name, eval_model, imu_verifier)
+    run_evaluation(run_name, eval_model, imu_verifier, val_pairs)
 
     del eval_model, fima_model
     gc.collect()

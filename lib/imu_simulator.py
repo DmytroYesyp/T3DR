@@ -76,12 +76,18 @@ class IMUSimulator:
         return accel_sensor
 
     def _compute_gyro(self, rotations):
-        """Angular velocity from consecutive rotations → sensor frame."""
+        """Angular velocity in sensor (body) frame from consecutive rotations.
+
+        A real gyroscope returns ω expressed in the sensor's own frame, i.e.
+        the right-multiplicative increment R[i+1] = R[i] · exp([ω_body·dt]×).
+        Using the world-frame increment (R[i+1] · R[i]^T) was wrong and made
+        any downstream filter integrate rotation as if R[i] = I.
+        """
         N = len(rotations)
         gyro = np.zeros((N, 3))
         for i in range(N - 1):
-            dR = rotations[i + 1] @ rotations[i].T
-            gyro[i] = self._rotation_log(dR) / self.dt
+            dR_body = rotations[i].T @ rotations[i + 1]
+            gyro[i] = self._rotation_log(dR_body) / self.dt
         if N > 1:
             gyro[-1] = gyro[-2]
         return gyro

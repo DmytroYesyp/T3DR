@@ -1,62 +1,51 @@
 """
-IMU-based z-displacement estimator used as an independent second opinion
-at evaluation time (NOT during training).
+Loosely-coupled visual + inertial fusion via Error-State Kalman Filter.
 
-The network predicts |dz| from images; this module predicts |dz| from
-(synthetic, noisy) IMU via proper double integration in world frame.
-The two estimates are then fused externally — see vis notebook.
+The visual model now supplies (|Δz|, σ); the ESKF in lib/eskf.py drives
+high-frequency IMU integration and uses σ as time-varying measurement
+noise. Replaces the previous open-loop double-integration + linear-α
+fusion — both the sign of Δz and the vision/IMU weighting now come
+from the filter's covariance rather than hand-tuned constants.
 
-Swap the IMUSimulator for a real sensor feed once available.
+Swap the IMUSimulator for a real sensor stream once available.
 """
 
 import numpy as np
 
+from lib.eskf import ESKF
+
 
 class IMUVerifier:
-    def __init__(self, imu_simulator, dt=1 / 30.0, gravity=9.81):
+    def __init__(self, imu_simulator, dt=1 / 30.0, gravity=9.81,
+                 default_visual_sigma=1.0):
         """
         Args:
-            imu_simulator: an IMUSimulator (or anything with .generate(tforms)
-                           returning [N, 6] of [accel_xyz, gyro_xyz])
-            dt:      time between frames (seconds)
-            gravity: gravity magnitude (m/s²); set 0 if accel is already
-                     gravity-compensated
+            imu_simulator:        anything with .generate(tforms) → [N, 6]
+            dt:                   frame interval (s)
+            gravity:              gravity magnitude; pass 0 if the
+                                  simulator is not adding it
+            default_visual_sigma: fallback σ when the visual model does
+                                  not predict its own uncertainty
         """
         self.imu_sim = imu_simulator
         self.dt = dt
-        self.gravity = np.array([0.0, 0.0, gravity], dtype=np.float64)
+        self.gravity = gravity
+        self.default_visual_sigma = default_visual_sigma
+        self.eskf = ESKF(dt=dt, gravity=gravity)
 
-    def estimate_step_magnitude(self, tforms):
-        """
-        Estimate |dz| between the last two frames of the given sequence
-        by double-integrating synthetic IMU over the whole window.
+    def reset(self, init_position, init_rotation):
+        self.eskf.reset(position=np.asarray(init_position, dtype=np.float64),
+                        rotation=np.asarray(init_rotation, dtype=np.float64))
 
-        Args:
-            tforms: [N, 4, 4] with N ≥ 3
-        Returns:
-            float — estimated |dz| (same units as tforms translation)
-        """
-        imu = self.imu_sim.generate(tforms)        # [N, 6]
-        accel_sensor = imu[:, :3].astype(np.float64)
-        rotations = tforms[:, :3, :3].astype(np.float64)
+    def precompute_imu(self, tforms):
+        return self.imu_sim.generate(tforms)
 
-        # Derotate accel to world frame and subtract gravity
-        accel_world = np.zeros_like(accel_sensor)
-        for i in range(len(accel_sensor)):
-            accel_world[i] = rotations[i] @ accel_sensor[i] - self.gravity
-
-        # Double integrate. v0 = 0 assumption → some drift, but relative
-        # dz between the last two samples stays bounded for short windows.
-        velocity = np.cumsum(accel_world * self.dt, axis=0)
-        position = np.cumsum(velocity * self.dt, axis=0)
-
-        return float(abs(position[-1, 2] - position[-2, 2]))
-
-    def fuse(self, z_visual, z_imu, alpha=0.7):
-        """
-        Weighted fusion of the two |dz| estimates.
-        alpha=1.0 → trust vision only;  alpha=0.0 → trust IMU only.
-        Default 0.7 leans on vision (usually more accurate in-plane) and
-        uses IMU to pull outlier predictions back toward physical plausibility.
-        """
-        return alpha * z_visual + (1.0 - alpha) * z_imu
+    def step(self, accel, gyro, z_visual_magnitude, sigma_visual=None):
+        """Advance one frame interval; return signed Δz."""
+        if sigma_visual is None:
+            sigma_visual = self.default_visual_sigma
+        z_before = float(self.eskf.p[2])
+        self.eskf.predict(accel, gyro)
+        self.eskf.update_dz_magnitude(z_visual_magnitude, sigma_visual)
+        self.eskf.commit_anchor()
+        return float(self.eskf.p[2]) - z_before
