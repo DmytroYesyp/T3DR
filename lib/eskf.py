@@ -107,7 +107,8 @@ class ESKF:
         innovation = z_signed - dz_pred
 
         R = np.array([[max(float(sigma) ** 2, 1e-6)]])
-        S = float(H @ self.P @ H.T + R)
+        # .item() — NumPy ≥1.25 refuses float() on a (1,1) array.
+        S = (H @ self.P @ H.T + R).item()
         K = (self.P @ H.T) / S
 
         delta = (K * innovation).flatten()

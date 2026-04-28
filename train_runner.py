@@ -1,6 +1,7 @@
 import os
 os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 
+import argparse
 import cv2
 import csv
 import gc
@@ -25,7 +26,7 @@ from lib.imu_verifier import IMUVerifier
 # =============================================================================
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 SEQ_LEN = 20
-BATCH_SIZE = 64
+BATCH_SIZE = 164
 EPOCHS = 6
 
 # In-model IMU fusion is OFF — IMU lives outside as a verifier (see below).
@@ -660,50 +661,71 @@ def run_evaluation(run_name, model, imu_verifier, val_pairs):
 # MAIN
 # =============================================================================
 if __name__ == '__main__':
-    print(f"[{get_time()}] --- STEP 1: PREPARING DATASETS ---")
+    parser = argparse.ArgumentParser(description='FiMA-Net training + IMU-verified evaluation')
+    parser.add_argument('--name', '-n', default=None,
+                        help='Run name base tag (auto-suffixed with _v{N}). Defaults to a config-derived tag.')
+    parser.add_argument('--eval-only', '-e', default=None, metavar='CKPT',
+                        help='Skip training; load this .pth checkpoint and run evaluation only.')
+    args = parser.parse_args()
 
-    train_ds = LargeUSDataset(TRAIN_FOLDERS, seq_len=SEQ_LEN, use_imu=USE_IMU)
-    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=0)
+    print(f"[{get_time()}] --- STEP 1: PREPARING DATASETS ---")
 
     val_pairs = collect_last_n_val_files(VAL_LAST_N)
     print(f"[{get_time()}] Validation set: {len(val_pairs)} cases")
-    val_datasets = [
-        MemoryUSDataset(fp, tp, seq_len=SEQ_LEN, use_imu=USE_IMU)
-        for fp, tp, _ in val_pairs
-    ]
-    val_ds = ConcatDataset(val_datasets)
-    val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False)
 
-    # Single shared versioned tag for training + evaluation artifacts.
-    base_tag = (
-        f"fima_seq{SEQ_LEN}_e{EPOCHS}"
-        f"{'_imufused' if USE_IMU else ''}"
-        f"{'_eskf' if USE_IMU_VERIFIER else ''}"
-        f"{'_unc' if PREDICT_UNCERTAINTY else ''}"
-    )
+    if args.name:
+        base_tag = args.name
+    elif args.eval_only:
+        ckpt_base = os.path.basename(args.eval_only)
+        for suf in ('_best.pth', '.pth'):
+            if ckpt_base.endswith(suf):
+                ckpt_base = ckpt_base[:-len(suf)]
+                break
+        base_tag = ckpt_base + '_eval'
+    else:
+        base_tag = (
+            f"fima_seq{SEQ_LEN}_e{EPOCHS}"
+            f"{'_imufused' if USE_IMU else ''}"
+            f"{'_eskf' if USE_IMU_VERIFIER else ''}"
+            f"{'_unc' if PREDICT_UNCERTAINTY else ''}"
+        )
     run_name = next_run_name(base_tag)
     print(f"[{get_time()}] Run tag: {run_name}")
 
-    print(f"[{get_time()}] --- STEP 2: TRAIN FIMA-NET ---")
-    fima_model = FiMANet(seq_len=SEQ_LEN, use_imu=USE_IMU, predict_uncertainty=PREDICT_UNCERTAINTY)
-    fima_history, best_model_path = train_model(
-        run_name, "FiMA_UnfrozenBackbone", fima_model, train_loader, val_loader, EPOCHS, use_imu=USE_IMU
-    )
+    fima_model = None
+    if args.eval_only:
+        best_model_path = args.eval_only
+        print(f"[{get_time()}] --- EVAL-ONLY: skipping training, loading {best_model_path} ---")
+    else:
+        train_ds = LargeUSDataset(TRAIN_FOLDERS, seq_len=SEQ_LEN, use_imu=USE_IMU)
+        train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=0)
+        val_datasets = [
+            MemoryUSDataset(fp, tp, seq_len=SEQ_LEN, use_imu=USE_IMU)
+            for fp, tp, _ in val_pairs
+        ]
+        val_ds = ConcatDataset(val_datasets)
+        val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False)
 
-    # Free training resources before eval
-    del train_loader, train_ds, val_loader, val_ds, val_datasets
-    gc.collect()
-    torch.cuda.empty_cache()
+        print(f"[{get_time()}] --- STEP 2: TRAIN FIMA-NET ---")
+        fima_model = FiMANet(seq_len=SEQ_LEN, use_imu=USE_IMU, predict_uncertainty=PREDICT_UNCERTAINTY)
+        fima_history, best_model_path = train_model(
+            run_name, "FiMA_UnfrozenBackbone", fima_model, train_loader, val_loader, EPOCHS, use_imu=USE_IMU
+        )
+
+        del train_loader, train_ds, val_loader, val_ds, val_datasets
+        gc.collect()
+        torch.cuda.empty_cache()
 
     print(f"[{get_time()}] --- STEP 3: EVALUATE WITH IMU VERIFIER ---")
-    # Reload best checkpoint into a fresh model in eval mode
     eval_model = FiMANet(seq_len=SEQ_LEN, use_imu=USE_IMU, predict_uncertainty=PREDICT_UNCERTAINTY).to(DEVICE)
     eval_model = load_weights_safe(eval_model, best_model_path)
 
     imu_verifier = IMUVerifier(IMUSimulator()) if USE_IMU_VERIFIER else None
     run_evaluation(run_name, eval_model, imu_verifier, val_pairs)
 
-    del eval_model, fima_model
+    del eval_model
+    if fima_model is not None:
+        del fima_model
     gc.collect()
     torch.cuda.empty_cache()
 
