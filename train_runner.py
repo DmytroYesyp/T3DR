@@ -50,12 +50,26 @@ VAL_LAST_N = 10  # validation = last N (frames, tforms) pairs sorted by subject/
 def get_time():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
+RUNS_ROOT = "runs"
+
 def next_run_name(prefix):
-    """Return '{prefix}_v{N}' where N is the lowest free integer version."""
+    """Return '{prefix}_v{N}' where N is the lowest free integer version.
+    Probes both legacy flat artifacts and the new runs/ directory layout
+    so versions keep incrementing across the migration.
+    """
     n = 1
-    while glob.glob(f"{prefix}_v{n}_*"):
+    while glob.glob(f"{prefix}_v{n}_*") or glob.glob(os.path.join(RUNS_ROOT, f"*_{prefix}_v{n}")):
         n += 1
     return f"{prefix}_v{n}"
+
+
+def make_run_dirs(run_name):
+    """Create runs/{YYYY-MM-DD_HHMMSS}_{run_name}/{,val_images}/ and return paths."""
+    ts = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+    run_dir = os.path.join(RUNS_ROOT, f"{ts}_{run_name}")
+    val_dir = os.path.join(run_dir, "val_images")
+    os.makedirs(val_dir, exist_ok=True)
+    return run_dir, val_dir
 
 def set_backbone_trainable(model, trainable):
     """Toggle requires_grad for layer2/3/4. stem and layer1 stay frozen."""
@@ -107,7 +121,8 @@ class MotionWeightedL1Loss(nn.Module):
 
     def forward(self, pred, target):
         base_loss = torch.abs(pred - target)
-        weight = 1.0 + self.alpha * target
+        # |target| so negative-direction frames aren't down-weighted.
+        weight = 1.0 + self.alpha * torch.abs(target)
         weighted_loss = base_loss * weight
         return torch.mean(weighted_loss)
 
@@ -127,7 +142,7 @@ class MotionWeightedHeteroscedasticLoss(nn.Module):
         log_var = torch.clamp(log_var, self.log_var_min, self.log_var_max)
         sq_err = (target - mu) ** 2
         nll = 0.5 * torch.exp(-log_var) * sq_err + 0.5 * log_var
-        weight = 1.0 + self.alpha * target
+        weight = 1.0 + self.alpha * torch.abs(target)
         return torch.mean(weight * nll)
 
 
@@ -179,7 +194,8 @@ class LargeUSDataset(Dataset):
             seq_imgs.append(np.expand_dims(img, axis=0))
 
         seq_tensor = torch.tensor(np.stack(seq_imgs), dtype=torch.float32)
-        target = torch.tensor(abs(tforms[-1, 2, 3] - tforms[-2, 2, 3]), dtype=torch.float32)
+        # Signed Δz — sign-from-IMU was unreliable; let the model learn direction.
+        target = torch.tensor(tforms[-1, 2, 3] - tforms[-2, 2, 3], dtype=torch.float32)
 
         if self.use_imu:
             imu_data = self.imu_sim.generate(tforms)[:self.seq_len]
@@ -216,7 +232,7 @@ class MemoryUSDataset(Dataset):
         seq_tensor = torch.tensor(np.stack(seq_imgs), dtype=torch.float32)
 
         tforms = self.t[start : start + self.seq_len + 1]
-        target = torch.tensor(abs(tforms[-1, 2, 3] - tforms[-2, 2, 3]), dtype=torch.float32)
+        target = torch.tensor(tforms[-1, 2, 3] - tforms[-2, 2, 3], dtype=torch.float32)
 
         if self.use_imu:
             imu_data = self.imu_sim.generate(tforms)[:self.seq_len]
@@ -228,7 +244,7 @@ class MemoryUSDataset(Dataset):
 # =============================================================================
 # TRAINING
 # =============================================================================
-def train_model(run_name, model_name, model, train_loader, val_loader, epochs, use_imu=False):
+def train_model(run_name, run_dir, model_name, model, train_loader, val_loader, epochs, use_imu=False):
     print(f"\n{'='*50}")
     print(f"[{get_time()}] INITIALIZING TRAINING FOR: {model_name}")
     print(f"[{get_time()}] Run name: {run_name}")
@@ -243,7 +259,7 @@ def train_model(run_name, model_name, model, train_loader, val_loader, epochs, u
         set_backbone_trainable(model, False)
         print(f"[{get_time()}] Warmup: backbone layer2/3/4 frozen.")
 
-    untrained_name = f"{run_name}_untrained.pth"
+    untrained_name = os.path.join(run_dir, f"{run_name}_untrained.pth")
     torch.save(model.state_dict(), untrained_name)
 
     backbone_params = list(model.stem.parameters()) + \
@@ -273,7 +289,7 @@ def train_model(run_name, model_name, model, train_loader, val_loader, epochs, u
 
     history = {'train': [], 'val': []}
     best_val_loss = float('inf')
-    best_model_path = f"{run_name}_best.pth"
+    best_model_path = os.path.join(run_dir, f"{run_name}_best.pth")
     total_batches = len(train_loader)
 
     for epoch in range(epochs):
@@ -364,7 +380,7 @@ def train_model(run_name, model_name, model, train_loader, val_loader, epochs, u
     plt.legend()
     plt.grid(True)
 
-    plot_filename = f"{run_name}_training_curve.png"
+    plot_filename = os.path.join(run_dir, f"{run_name}_training_curve.png")
     plt.savefig(plot_filename, dpi=300, bbox_inches='tight')
     plt.close()
     print(f"[{get_time()}] Loss plot saved to {plot_filename}")
@@ -428,10 +444,7 @@ def predict_z_trajectory(model, frames, tforms, imu_verifier, start_idx=0, end_i
                 signed_step = imu_verifier.step(accel, gyro, z_visual, sigma_visual)
                 curr_z_pred += signed_step
             else:
-                # Visual-only: model predicts magnitude, sign comes from GT (a known
-                # leak that the ESKF removes — keep visual-only path for ablation).
-                direction = np.sign(real_step) if real_step != 0 else 1
-                curr_z_pred += z_visual * direction
+                curr_z_pred += z_visual
 
             curr_z_real += real_step
 
@@ -490,7 +503,7 @@ def plot_z_trajectory(z_pred, z_real, title, filename, using_imu):
     plt.close()
     print(f"[{get_time()}] Saved Z-plot: {filename}")
 
-def run_evaluation(run_name, model, imu_verifier, val_pairs):
+def run_evaluation(run_name, run_dir, val_dir, model, imu_verifier, val_pairs):
     print(f"\n{'='*50}")
     print(f"[{get_time()}] EVALUATION PHASE")
     print(f"[{get_time()}] IMU Verifier: {'ENABLED (ESKF)' if imu_verifier else 'DISABLED'}")
@@ -516,13 +529,13 @@ def run_evaluation(run_name, model, imu_verifier, val_pairs):
         except Exception as e:
             print(f"[{get_time()}]   ERROR on {case_name}: {e}")
 
-    # Per-case Z plots
+    # Per-case Z plots → val_images/ subfolder
     for i, r in enumerate(val_results):
         safe = r['name'].replace('/', '_').replace('.h5', '')
         plot_z_trajectory(
             r['z_pred'], r['z_real'],
             f"Validation: {r['name']}\nFDR: {r['fdr']:.2f}% | MAE: {r['mae']:.2f}mm",
-            f"{run_name}_val_{i:02d}_{safe}.png",
+            os.path.join(val_dir, f"{run_name}_val_{i:02d}_{safe}.png"),
             using_imu=imu_verifier is not None,
         )
 
@@ -549,9 +562,10 @@ def run_evaluation(run_name, model, imu_verifier, val_pairs):
             axes[j].axis('off')
         fig.suptitle(f"{run_name} — Validation Z-trajectories ({n} cases)", fontsize=12)
         plt.tight_layout()
-        plt.savefig(f"{run_name}_val_grid.png", dpi=200, bbox_inches='tight')
+        grid_path = os.path.join(run_dir, f"{run_name}_val_grid.png")
+        plt.savefig(grid_path, dpi=200, bbox_inches='tight')
         plt.close()
-        print(f"[{get_time()}] Saved validation grid: {run_name}_val_grid.png")
+        print(f"[{get_time()}] Saved validation grid: {grid_path}")
 
         val_avg_mae   = float(np.mean([r['mae']   for r in val_results]))
         val_avg_drift = float(np.mean([r['drift'] for r in val_results]))
@@ -630,28 +644,30 @@ def run_evaluation(run_name, model, imu_verifier, val_pairs):
     )
     print(summary_text)
 
-    with open(f"{run_name}_summary.txt", "w") as f:
+    summary_path = os.path.join(run_dir, f"{run_name}_summary.txt")
+    with open(summary_path, "w") as f:
         f.write(summary_text)
-    print(f"[{get_time()}] Saved summary: {run_name}_summary.txt")
+    print(f"[{get_time()}] Saved summary: {summary_path}")
 
-    with open(f"{run_name}_per_scan.csv", "w", newline='') as csvfile:
+    csv_path = os.path.join(run_dir, f"{run_name}_per_scan.csv")
+    with open(csv_path, "w", newline='') as csvfile:
         writer = csv.writer(csvfile)
         writer.writerow(["Scan_Name", "MAE_mm", "Final_Drift_mm", "FDR_percent"])
         writer.writerows(detailed_metrics)
-    print(f"[{get_time()}] Saved per-scan metrics: {run_name}_per_scan.csv")
+    print(f"[{get_time()}] Saved per-scan metrics: {csv_path}")
 
     if best_data:
         plot_z_trajectory(
             best_data[0], best_data[1],
             f"BEST CASE: {best_data[2]}\nFDR: {best_data[3]:.2f}% | MAE: {best_data[4]:.2f} mm",
-            f"{run_name}_bestscan.png",
+            os.path.join(run_dir, f"{run_name}_bestscan.png"),
             using_imu=imu_verifier is not None,
         )
     if worst_data:
         plot_z_trajectory(
             worst_data[0], worst_data[1],
             f"WORST CASE: {worst_data[2]}\nFDR: {worst_data[3]:.2f}% | MAE: {worst_data[4]:.2f} mm",
-            f"{run_name}_worstscan.png",
+            os.path.join(run_dir, f"{run_name}_worstscan.png"),
             using_imu=imu_verifier is not None,
         )
 
@@ -690,7 +706,9 @@ if __name__ == '__main__':
             f"{'_unc' if PREDICT_UNCERTAINTY else ''}"
         )
     run_name = next_run_name(base_tag)
+    run_dir, val_dir = make_run_dirs(run_name)
     print(f"[{get_time()}] Run tag: {run_name}")
+    print(f"[{get_time()}] Run dir: {run_dir}")
 
     fima_model = None
     if args.eval_only:
@@ -709,7 +727,7 @@ if __name__ == '__main__':
         print(f"[{get_time()}] --- STEP 2: TRAIN FIMA-NET ---")
         fima_model = FiMANet(seq_len=SEQ_LEN, use_imu=USE_IMU, predict_uncertainty=PREDICT_UNCERTAINTY)
         fima_history, best_model_path = train_model(
-            run_name, "FiMA_UnfrozenBackbone", fima_model, train_loader, val_loader, EPOCHS, use_imu=USE_IMU
+            run_name, run_dir, "FiMA_UnfrozenBackbone", fima_model, train_loader, val_loader, EPOCHS, use_imu=USE_IMU
         )
 
         del train_loader, train_ds, val_loader, val_ds, val_datasets
@@ -721,7 +739,7 @@ if __name__ == '__main__':
     eval_model = load_weights_safe(eval_model, best_model_path)
 
     imu_verifier = IMUVerifier(IMUSimulator()) if USE_IMU_VERIFIER else None
-    run_evaluation(run_name, eval_model, imu_verifier, val_pairs)
+    run_evaluation(run_name, run_dir, val_dir, eval_model, imu_verifier, val_pairs)
 
     del eval_model
     if fima_model is not None:

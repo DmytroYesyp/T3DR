@@ -1,11 +1,12 @@
 """
 Loosely-coupled visual + inertial fusion via Error-State Kalman Filter.
 
-The visual model now supplies (|Δz|, σ); the ESKF in lib/eskf.py drives
+The visual model supplies (signed Δz, σ); the ESKF in lib/eskf.py drives
 high-frequency IMU integration and uses σ as time-varying measurement
 noise. Replaces the previous open-loop double-integration + linear-α
-fusion — both the sign of Δz and the vision/IMU weighting now come
-from the filter's covariance rather than hand-tuned constants.
+fusion — and the earlier |Δz| + sign-from-IMU scheme, which was unstable
+because the IMU cannot reliably resolve direction over a single 33 ms
+frame (accel noise dominates real velocity signal).
 
 Swap the IMUSimulator for a real sensor stream once available.
 """
@@ -40,12 +41,12 @@ class IMUVerifier:
     def precompute_imu(self, tforms):
         return self.imu_sim.generate(tforms)
 
-    def step(self, accel, gyro, z_visual_magnitude, sigma_visual=None):
+    def step(self, accel, gyro, z_visual, sigma_visual=None):
         """Advance one frame interval; return signed Δz."""
         if sigma_visual is None:
             sigma_visual = self.default_visual_sigma
         z_before = float(self.eskf.p[2])
         self.eskf.predict(accel, gyro)
-        self.eskf.update_dz_magnitude(z_visual_magnitude, sigma_visual)
+        self.eskf.update_dz(z_visual, sigma_visual)
         self.eskf.commit_anchor()
         return float(self.eskf.p[2]) - z_before

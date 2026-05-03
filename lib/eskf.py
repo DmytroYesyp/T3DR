@@ -3,7 +3,7 @@ Loosely-coupled 15-state Error-State Kalman Filter for trackerless
 ultrasound probe tracking.
 
 The ESKF runs IMU dead-reckoning between visual frames and accepts
-|Δz| measurements from the visual model at frame rate. Online
+signed Δz measurements from the visual model at frame rate. Online
 estimation of accelerometer and gyroscope biases keeps long-term
 drift bounded — the previous open-loop double-integration cannot do
 this and is what made the linear-α verifier marginal.
@@ -91,16 +91,18 @@ class ESKF:
 
         self.P = F @ self.P @ F.T + self.Q
 
-    def update_dz_magnitude(self, dz_visual_magnitude, sigma):
+    def update_dz(self, dz_visual, sigma):
         """
-        |Δz| measurement update against the last committed anchor.
-        The IMU-integrated state already carries a sign, so we cast the
-        visual magnitude into the IMU-implied direction. With proper σ
-        the bias states absorb persistent IMU drift over time.
+        Signed Δz measurement update against the last committed anchor.
+        The visual model now predicts a signed scalar directly. Earlier
+        attempts at sign-from-IMU were unreliable: over a 33 ms frame the
+        accel/gyro noise dominates any real velocity signal, so the first
+        1–2 frames effectively coin-flipped trajectory direction and the
+        ESKF velocity state then locked it in. With proper σ the bias
+        states absorb persistent IMU drift over time.
         """
         dz_pred = float(self.p[2] - self.p_anchor[2])
-        sign = np.sign(dz_pred) if abs(dz_pred) > 1e-9 else 1.0
-        z_signed = sign * float(dz_visual_magnitude)
+        z_signed = float(dz_visual)
 
         H = np.zeros((1, 15))
         H[0, 2] = 1.0
