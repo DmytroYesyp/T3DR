@@ -63,9 +63,12 @@ class ESKF:
         ])
         self.reset()
 
-    def reset(self, position=None, rotation=None):
+    def reset(self, position=None, rotation=None, velocity=None):
         self.p = np.zeros(3) if position is None else np.asarray(position, dtype=np.float64).copy()
-        self.v = np.zeros(3)
+        # Bootstrap v from the visual model's first prediction so the IMU's
+        # first sign decision isn't dominated by accel noise (the original
+        # coin-flip failure mode).
+        self.v = np.zeros(3) if velocity is None else np.asarray(velocity, dtype=np.float64).copy()
         self.R = np.eye(3) if rotation is None else np.asarray(rotation, dtype=np.float64).copy()
         self.b_a = np.zeros(3)
         self.b_g = np.zeros(3)

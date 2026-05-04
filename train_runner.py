@@ -407,13 +407,28 @@ def predict_z_trajectory(model, frames, tforms, imu_verifier, start_idx=0, end_i
     traj_pred = [curr_z_pred]
     traj_real = [curr_z_real]
 
+    use_uncertainty = getattr(model, 'predict_uncertainty', False)
+
     if imu_verifier is not None:
         imu_full = imu_verifier.precompute_imu(tforms)
         init_pos = np.array([0.0, 0.0, curr_z_pred], dtype=np.float64)
         init_rot = tforms[start_idx + SEQ_LEN - 1, :3, :3].astype(np.float64)
-        imu_verifier.reset(init_pos, init_rot)
 
-    use_uncertainty = getattr(model, 'predict_uncertainty', False)
+        # Bootstrap v_z from the model's first signed Δz prediction so the
+        # filter doesn't coin-flip direction in the first 1–2 frames before
+        # any visual updates have arrived.
+        first_imgs = []
+        for i in range(SEQ_LEN):
+            img = frames[start_idx + i]
+            img = cv2.resize(img, (256, 256))
+            if img.max() > 1.0: img = img / 255.0
+            first_imgs.append(np.expand_dims(img, axis=0))
+        first_inp = torch.tensor(np.stack(first_imgs), dtype=torch.float32).unsqueeze(0).to(DEVICE)
+        with torch.no_grad():
+            first_out = model(first_inp)
+            first_dz = float(first_out[0].item() if use_uncertainty else first_out.item())
+        init_vel = np.array([0.0, 0.0, first_dz / imu_verifier.dt], dtype=np.float64)
+        imu_verifier.reset(init_pos, init_rot, init_velocity=init_vel)
 
     with torch.no_grad():
         for t in range(start_idx, end_idx - SEQ_LEN):
