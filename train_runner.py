@@ -42,7 +42,8 @@ TRAIN_FOLDERS = [os.path.join(BASE_DATA_DIR, str(i).zfill(3)) for i in range(50)
 
 VAL_FRAMES_ROOT = os.path.join(BASE_DATA_DIR, 'valDataset/data/frames')
 VAL_TFORMS_ROOT = os.path.join(BASE_DATA_DIR, 'valDataset/data/transfs')
-VAL_LAST_N = 10  # validation = last N (frames, tforms) pairs sorted by subject/scan
+VAL_LAST_N = 10  # legacy: last N pairs alphabetically (monovariate)
+VAL_PER_SUBJECT = 4  # stratified: N scans per validation subject
 
 # =============================================================================
 # UTILITIES
@@ -81,6 +82,9 @@ def collect_last_n_val_files(n=VAL_LAST_N):
     """Last n (frames_path, tforms_path, case_name) triples from VAL_FRAMES_ROOT,
     sorted by subject then filename. Tolerant of missing tform pairs and a
     flat (no-subject-subdir) layout.
+
+    NOTE: Kept for backward compatibility. Prefer collect_val_files_stratified
+    so the validation signal isn't dominated by a single subject.
     """
     pairs = []
     if not os.path.isdir(VAL_FRAMES_ROOT):
@@ -96,6 +100,30 @@ def collect_last_n_val_files(n=VAL_LAST_N):
             if os.path.exists(tpath):
                 pairs.append((os.path.join(sd, fname), tpath, f"{subj}/{fname}"))
     return pairs[-n:]
+
+
+def collect_val_files_stratified(n_per_subject=4):
+    """Take n_per_subject scans from EACH validation subject. Avoids the
+    pathology where the previous 'last 10 alphabetically' selector was
+    monovariate (all from the alphabetically-last subject), making
+    cross-subject generalization invisible to the val signal.
+    """
+    pairs = []
+    if not os.path.isdir(VAL_FRAMES_ROOT):
+        return pairs
+    for subj in sorted(os.listdir(VAL_FRAMES_ROOT)):
+        sd = os.path.join(VAL_FRAMES_ROOT, subj)
+        if not os.path.isdir(sd):
+            continue
+        subj_pairs = []
+        for fname in sorted(os.listdir(sd)):
+            if not fname.endswith('.h5'):
+                continue
+            tpath = os.path.join(VAL_TFORMS_ROOT, subj, fname)
+            if os.path.exists(tpath):
+                subj_pairs.append((os.path.join(sd, fname), tpath, f"{subj}/{fname}"))
+        pairs.extend(subj_pairs[:n_per_subject])
+    return pairs
 
 def load_weights_safe(model, path):
     print(f"[{get_time()}] Loading weights from {path}...")
@@ -414,19 +442,24 @@ def predict_z_trajectory(model, frames, tforms, imu_verifier, start_idx=0, end_i
         init_pos = np.array([0.0, 0.0, curr_z_pred], dtype=np.float64)
         init_rot = tforms[start_idx + SEQ_LEN - 1, :3, :3].astype(np.float64)
 
-        # Bootstrap v_z from the model's first signed Δz prediction so the
-        # filter doesn't coin-flip direction in the first 1–2 frames before
-        # any visual updates have arrived.
-        first_imgs = []
-        for i in range(SEQ_LEN):
-            img = frames[start_idx + i]
-            img = cv2.resize(img, (256, 256))
-            if img.max() > 1.0: img = img / 255.0
-            first_imgs.append(np.expand_dims(img, axis=0))
-        first_inp = torch.tensor(np.stack(first_imgs), dtype=torch.float32).unsqueeze(0).to(DEVICE)
-        with torch.no_grad():
-            first_out = model(first_inp)
-            first_dz = float(first_out[0].item() if use_uncertainty else first_out.item())
+        # Bootstrap v_z by averaging the first N model predictions. A single
+        # first-frame estimate was noisy enough to point v_z the wrong way on
+        # some scans (Par_S_PtD, Par_L_DtP regressed in the bootstrap_v1 run);
+        # averaging tames that variance without biasing direction.
+        n_init = min(5, max(1, end_idx - start_idx - SEQ_LEN))
+        init_dzs = []
+        for k in range(n_init):
+            seq_imgs = []
+            for i in range(SEQ_LEN):
+                img = frames[start_idx + k + i]
+                img = cv2.resize(img, (256, 256))
+                if img.max() > 1.0: img = img / 255.0
+                seq_imgs.append(np.expand_dims(img, axis=0))
+            inp = torch.tensor(np.stack(seq_imgs), dtype=torch.float32).unsqueeze(0).to(DEVICE)
+            with torch.no_grad():
+                out = model(inp)
+                init_dzs.append(float(out[0].item() if use_uncertainty else out.item()))
+        first_dz = float(np.mean(init_dzs))
         init_vel = np.array([0.0, 0.0, first_dz / imu_verifier.dt], dtype=np.float64)
         imu_verifier.reset(init_pos, init_rot, init_velocity=init_vel)
 
@@ -701,8 +734,9 @@ if __name__ == '__main__':
 
     print(f"[{get_time()}] --- STEP 1: PREPARING DATASETS ---")
 
-    val_pairs = collect_last_n_val_files(VAL_LAST_N)
-    print(f"[{get_time()}] Validation set: {len(val_pairs)} cases")
+    val_pairs = collect_val_files_stratified(VAL_PER_SUBJECT)
+    n_subjects = len({c.split('/')[0] for _, _, c in val_pairs}) if val_pairs else 0
+    print(f"[{get_time()}] Validation set: {len(val_pairs)} cases across {n_subjects} subject(s)")
 
     if args.name:
         base_tag = args.name
