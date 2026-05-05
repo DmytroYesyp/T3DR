@@ -27,7 +27,7 @@ from lib.imu_verifier import IMUVerifier
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 SEQ_LEN = 20
 BATCH_SIZE = 164
-EPOCHS = 6
+EPOCHS = 10
 
 # In-model IMU fusion is OFF — IMU lives outside as a verifier (see below).
 USE_IMU = False
@@ -35,7 +35,7 @@ WARMUP_EPOCHS = 2  # freeze layer2/3/4 for this many epochs
 
 # Eval-time IMU verifier settings
 USE_IMU_VERIFIER = True
-PREDICT_UNCERTAINTY = True  # heteroscedastic head feeds σ to the ESKF as measurement noise
+PREDICT_UNCERTAINTY = False
 
 BASE_DATA_DIR = "/home/123ghdh/datasets"
 TRAIN_FOLDERS = [os.path.join(BASE_DATA_DIR, str(i).zfill(3)) for i in range(50)]
@@ -305,7 +305,10 @@ def train_model(run_name, run_dir, model_name, model, train_loader, val_loader, 
         head_params += list(model.fusion_gate.parameters())
 
     optimizer = torch.optim.Adam([
-        {'params': backbone_params, 'lr': 1e-5},
+        # 1e-5 destabilized post-unfreeze on the prior 4-epoch run (val NLL went
+        # from -1.19 to -0.70 at Ep4); halving it tames that without crippling
+        # adaptation of the ResNet features.
+        {'params': backbone_params, 'lr': 5e-6},
         {'params': head_params, 'lr': 1e-4}
     ], weight_decay=1e-5)
 
@@ -316,7 +319,9 @@ def train_model(run_name, run_dir, model_name, model, train_loader, val_loader, 
     scaler = GradScaler('cuda')
 
     history = {'train': [], 'val': []}
-    best_val_loss = float('inf')
+    # Track best by val MAE (the L1 we care about) instead of val NLL —
+    # heteroscedastic NLL can drop while MAE worsens if log_var overfits.
+    best_val_mae = float('inf')
     best_model_path = os.path.join(run_dir, f"{run_name}_best.pth")
     total_batches = len(train_loader)
 
@@ -393,10 +398,10 @@ def train_model(run_name, run_dir, model_name, model, train_loader, val_loader, 
 
         print(f"[{get_time()}] Epoch {epoch+1} Summary: Train Loss={avg_train:.4f} | Val Loss={avg_val:.4f} | (Real MAE: {avg_mae:.4f} mm)")
 
-        if avg_val < best_val_loss:
-            best_val_loss = avg_val
+        if avg_mae < best_val_mae:
+            best_val_mae = avg_mae
             torch.save(model.state_dict(), best_model_path)
-            print(f"[{get_time()}] Best {model_name} saved as {best_model_path}.")
+            print(f"[{get_time()}] Best {model_name} saved as {best_model_path} (val MAE {avg_mae:.4f} mm).")
 
     # Training curve plot
     plt.figure(figsize=(10, 5))
