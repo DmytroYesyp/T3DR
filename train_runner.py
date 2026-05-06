@@ -36,6 +36,14 @@ WARMUP_EPOCHS = 2  # freeze layer2/3/4 for this many epochs
 # Eval-time IMU verifier settings
 USE_IMU_VERIFIER = True
 PREDICT_UNCERTAINTY = False
+# Two-head: |Δz| regression + binary sign classification. Single-head signed
+# regression plateaued (val MAE ~0.14 mm, severe FDR on *_L_DtP cases) due to
+# a directional bias the model can't unlearn. Decoupling magnitude from
+# direction lets each head specialize.
+PREDICT_SIGN_TWO_HEAD = True
+SIGN_LOSS_WEIGHT = 0.3       # λ in total = mag_l1 + λ * BCE(sign)
+SIGN_LABEL_MIN_DZ = 0.01     # mm — frames with |Δz| below this are masked
+                              # from BCE since their sign is essentially noise
 
 BASE_DATA_DIR = "/home/123ghdh/datasets"
 TRAIN_FOLDERS = [os.path.join(BASE_DATA_DIR, str(i).zfill(3)) for i in range(50)]
@@ -174,6 +182,39 @@ class MotionWeightedHeteroscedasticLoss(nn.Module):
         return torch.mean(weight * nll)
 
 
+class MotionWeightedTwoHeadLoss(nn.Module):
+    """Magnitude L1 (motion-weighted) + binary cross-entropy on sign.
+
+    Sign labels for very small motion (|Δz| ≈ 0) are essentially noise — we
+    mask them out of the BCE term so the classifier isn't penalized for
+    coin-flipping on near-stationary frames.
+
+    Combined: total = mag_l1 + sign_weight * sign_bce
+    Returns (total, mag_loss, sign_loss) so training can log both.
+    """
+    def __init__(self, alpha=2.0, sign_weight=0.3, sign_min_dz=0.01):
+        super().__init__()
+        self.alpha = alpha
+        self.sign_weight = sign_weight
+        self.sign_min_dz = sign_min_dz
+        self.bce = nn.BCEWithLogitsLoss(reduction='none')
+
+    def forward(self, mag_pred, sign_logit, target):
+        target_abs = torch.abs(target)
+        target_sign = (target > 0).float()
+
+        mag_l1 = torch.abs(mag_pred - target_abs)
+        mag_weight = 1.0 + self.alpha * target_abs
+        mag_loss = (mag_weight * mag_l1).mean()
+
+        sign_mask = (target_abs > self.sign_min_dz).float()
+        sign_bce = self.bce(sign_logit, target_sign) * sign_mask
+        denom = sign_mask.sum().clamp(min=1.0)
+        sign_loss = sign_bce.sum() / denom
+
+        return mag_loss + self.sign_weight * sign_loss, mag_loss, sign_loss
+
+
 # =============================================================================
 # DATASETS
 # =============================================================================
@@ -297,8 +338,15 @@ def train_model(run_name, run_dir, model_name, model, train_loader, val_loader, 
                       list(model.layer4.parameters())
 
     head_params = list(model.fusion.parameters()) + \
-                  list(model.temporal_layers.parameters()) + \
-                  list(model.head.parameters())
+                  list(model.temporal_layers.parameters())
+
+    # In two-head mode the regression head is split; otherwise there's a
+    # single self.head sequential module.
+    if getattr(model, 'predict_sign', False):
+        head_params += list(model.head_mag.parameters())
+        head_params += list(model.head_sign.parameters())
+    else:
+        head_params += list(model.head.parameters())
 
     if use_imu:
         head_params += list(model.imu_encoder.parameters())
@@ -315,7 +363,14 @@ def train_model(run_name, run_dir, model_name, model, train_loader, val_loader, 
     # patience=3 so the scheduler doesn't drop LR on a single noisy val epoch
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=3)
 
-    criterion = MotionWeightedHeteroscedasticLoss(alpha=2.0) if PREDICT_UNCERTAINTY else MotionWeightedL1Loss(alpha=2.0)
+    if PREDICT_SIGN_TWO_HEAD:
+        criterion = MotionWeightedTwoHeadLoss(
+            alpha=2.0, sign_weight=SIGN_LOSS_WEIGHT, sign_min_dz=SIGN_LABEL_MIN_DZ
+        )
+    elif PREDICT_UNCERTAINTY:
+        criterion = MotionWeightedHeteroscedasticLoss(alpha=2.0)
+    else:
+        criterion = MotionWeightedL1Loss(alpha=2.0)
     scaler = GradScaler('cuda')
 
     history = {'train': [], 'val': []}
@@ -345,7 +400,10 @@ def train_model(run_name, run_dir, model_name, model, train_loader, val_loader, 
             optimizer.zero_grad()
             with autocast(device_type='cuda', dtype=torch.float16):
                 outputs = model(seqs, imu=imus)
-                if PREDICT_UNCERTAINTY:
+                if PREDICT_SIGN_TWO_HEAD:
+                    mag, sign_logit = outputs
+                    loss, _, _ = criterion(mag, sign_logit, targets)
+                elif PREDICT_UNCERTAINTY:
                     mu, log_var = outputs
                     loss = criterion(mu, log_var, targets)
                 else:
@@ -381,7 +439,14 @@ def train_model(run_name, run_dir, model_name, model, train_loader, val_loader, 
 
                 with autocast(device_type='cuda', dtype=torch.float16):
                     outputs = model(seqs, imu=imus)
-                    if PREDICT_UNCERTAINTY:
+                    if PREDICT_SIGN_TWO_HEAD:
+                        mag, sign_logit = outputs
+                        v_loss, _, _ = criterion(mag, sign_logit, targets)
+                        # Combined signed prediction so val MAE is comparable
+                        # to single-head signed regression baselines.
+                        signed_pred = mag * torch.tanh(sign_logit)
+                        v_mae = pure_l1(signed_pred, targets)
+                    elif PREDICT_UNCERTAINTY:
                         mu, log_var = outputs
                         v_loss = criterion(mu, log_var, targets)
                         v_mae = pure_l1(mu, targets)
@@ -441,6 +506,18 @@ def predict_z_trajectory(model, frames, tforms, imu_verifier, start_idx=0, end_i
     traj_real = [curr_z_real]
 
     use_uncertainty = getattr(model, 'predict_uncertainty', False)
+    use_two_head    = getattr(model, 'predict_sign', False)
+
+    def _model_signed_dz(out):
+        """Resolve a single signed Δz scalar from any of the supported model
+        output shapes: two-head (mag, sign_logit) → mag·tanh(logit); hetero
+        (mu, log_var) → mu; plain regression → out."""
+        if use_two_head:
+            mag_t, sign_logit_t = out
+            return float((mag_t * torch.tanh(sign_logit_t)).item())
+        if use_uncertainty:
+            return float(out[0].item())
+        return float(out.item())
 
     if imu_verifier is not None:
         imu_full = imu_verifier.precompute_imu(tforms)
@@ -462,8 +539,7 @@ def predict_z_trajectory(model, frames, tforms, imu_verifier, start_idx=0, end_i
                 seq_imgs.append(np.expand_dims(img, axis=0))
             inp = torch.tensor(np.stack(seq_imgs), dtype=torch.float32).unsqueeze(0).to(DEVICE)
             with torch.no_grad():
-                out = model(inp)
-                init_dzs.append(float(out[0].item() if use_uncertainty else out.item()))
+                init_dzs.append(_model_signed_dz(model(inp)))
         first_dz = float(np.mean(init_dzs))
         init_vel = np.array([0.0, 0.0, first_dz / imu_verifier.dt], dtype=np.float64)
         imu_verifier.reset(init_pos, init_rot, init_velocity=init_vel)
@@ -480,12 +556,12 @@ def predict_z_trajectory(model, frames, tforms, imu_verifier, start_idx=0, end_i
             inp = torch.tensor(np.stack(seq_imgs), dtype=torch.float32).unsqueeze(0).to(DEVICE)
 
             out = model(inp)
+            z_visual = _model_signed_dz(out)
             if use_uncertainty:
-                mu_t, log_var_t = out
-                z_visual = float(mu_t.item())
-                sigma_visual = float(torch.exp(0.5 * log_var_t).item())
+                # log_var still available for any future σ-aware path; the
+                # verifier currently uses fixed σ regardless.
+                sigma_visual = float(torch.exp(0.5 * out[1]).item())
             else:
-                z_visual = float(out.item())
                 sigma_visual = None
 
             real_step = tforms[t + SEQ_LEN, 2, 3] - tforms[t + SEQ_LEN - 1, 2, 3]
@@ -779,7 +855,9 @@ if __name__ == '__main__':
         val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False)
 
         print(f"[{get_time()}] --- STEP 2: TRAIN FIMA-NET ---")
-        fima_model = FiMANet(seq_len=SEQ_LEN, use_imu=USE_IMU, predict_uncertainty=PREDICT_UNCERTAINTY)
+        fima_model = FiMANet(seq_len=SEQ_LEN, use_imu=USE_IMU,
+                             predict_uncertainty=PREDICT_UNCERTAINTY,
+                             predict_sign=PREDICT_SIGN_TWO_HEAD)
         fima_history, best_model_path = train_model(
             run_name, run_dir, "FiMA_UnfrozenBackbone", fima_model, train_loader, val_loader, EPOCHS, use_imu=USE_IMU
         )
@@ -789,7 +867,9 @@ if __name__ == '__main__':
         torch.cuda.empty_cache()
 
     print(f"[{get_time()}] --- STEP 3: EVALUATE WITH IMU VERIFIER ---")
-    eval_model = FiMANet(seq_len=SEQ_LEN, use_imu=USE_IMU, predict_uncertainty=PREDICT_UNCERTAINTY).to(DEVICE)
+    eval_model = FiMANet(seq_len=SEQ_LEN, use_imu=USE_IMU,
+                         predict_uncertainty=PREDICT_UNCERTAINTY,
+                         predict_sign=PREDICT_SIGN_TWO_HEAD).to(DEVICE)
     eval_model = load_weights_safe(eval_model, best_model_path)
 
     imu_verifier = IMUVerifier(IMUSimulator()) if USE_IMU_VERIFIER else None

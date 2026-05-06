@@ -38,12 +38,18 @@ class TemporalSSMBlock(nn.Module):
 class FiMANet(nn.Module):
     def __init__(self, seq_len=10, hidden_size=256, num_layers=2,
                  use_imu=False, imu_channels=6, output_dim=1,
-                 predict_uncertainty=False):
+                 predict_uncertainty=False, predict_sign=False):
         super().__init__()
         self.seq_len = seq_len
         self.use_imu = use_imu
         self.output_dim = output_dim
         self.predict_uncertainty = predict_uncertainty
+        # Two-head mode: regress |Δz| and classify sign(Δz) separately.
+        # Decouples directional bias (single signed regression had it baked in)
+        # from magnitude noise. Mutually exclusive with predict_uncertainty.
+        self.predict_sign = predict_sign
+        if predict_sign and predict_uncertainty:
+            raise ValueError("predict_sign and predict_uncertainty are mutually exclusive")
 
         # Backbone (ResNet-18)
         base_resnet = models.resnet18(weights='IMAGENET1K_V1')
@@ -92,13 +98,30 @@ class FiMANet(nn.Module):
             TemporalSSMBlock(d_model=hidden_size) for _ in range(num_layers)
         ])
 
-        head_out = output_dim * 2 if predict_uncertainty else output_dim
-        self.head = nn.Sequential(
-            nn.Linear(hidden_size, 64),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(64, head_out)
-        )
+        if predict_sign:
+            # Two heads sharing the same temporal features. Splitting after
+            # the temporal stack (rather than the backbone) lets both tasks
+            # benefit from the same motion-context features.
+            self.head_mag = nn.Sequential(
+                nn.Linear(hidden_size, 64),
+                nn.ReLU(),
+                nn.Dropout(0.3),
+                nn.Linear(64, output_dim),
+            )
+            self.head_sign = nn.Sequential(
+                nn.Linear(hidden_size, 64),
+                nn.ReLU(),
+                nn.Dropout(0.3),
+                nn.Linear(64, output_dim),
+            )
+        else:
+            head_out = output_dim * 2 if predict_uncertainty else output_dim
+            self.head = nn.Sequential(
+                nn.Linear(hidden_size, 64),
+                nn.ReLU(),
+                nn.Dropout(0.3),
+                nn.Linear(64, head_out)
+            )
 
     def forward(self, x, imu=None):
         b, s, c, h, w = x.size()
@@ -132,7 +155,17 @@ class FiMANet(nn.Module):
         for layer in self.temporal_layers:
             features = layer(features)
 
-        out = self.head(features[:, -1, :])
+        last = features[:, -1, :]
+
+        if self.predict_sign:
+            mag = self.head_mag(last)
+            sign_logit = self.head_sign(last)
+            if self.output_dim == 1:
+                mag = mag.squeeze(-1)
+                sign_logit = sign_logit.squeeze(-1)
+            return mag, sign_logit
+
+        out = self.head(last)
         if self.predict_uncertainty:
             mu = out[..., :self.output_dim]
             log_var = out[..., self.output_dim:]
