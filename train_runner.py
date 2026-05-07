@@ -219,11 +219,14 @@ class MotionWeightedTwoHeadLoss(nn.Module):
 # DATASETS
 # =============================================================================
 class LargeUSDataset(Dataset):
-    def __init__(self, root_dirs, seq_len=5, use_imu=False):
+    def __init__(self, root_dirs, seq_len=5, use_imu=False, augment=False):
         self.samples = []
         self.seq_len = seq_len
         self.use_imu = use_imu
+        self.augment = augment
         self.imu_sim = IMUSimulator() if use_imu else None
+        if augment:
+            print(f"[{get_time()}] Augmentation: ON (hflip / brightness / contrast / speckle).")
         print(f"[{get_time()}] Indexing folders...")
 
         for folder in root_dirs:
@@ -249,6 +252,46 @@ class LargeUSDataset(Dataset):
 
     def __len__(self): return len(self.samples)
 
+    @staticmethod
+    def _augment_sequence(seq_imgs):
+        """Conservative ultrasound-appropriate augmentation, applied identically
+        to every frame in the sequence so temporal coherence (and therefore the
+        Δz target) is preserved.
+
+        Included:
+          • Horizontal flip (p=0.5): probe scan plane is symmetric in x; lateral
+            flip preserves z-axis motion semantics.
+          • Brightness/contrast jitter (p=0.5, ±10%): mimics gain variation
+            across acquisitions on the same machine.
+          • Light multiplicative speckle (p=0.3, σ=0.05): matches ultrasound
+            noise model; light enough not to obliterate texture cues.
+
+        Deliberately omitted: vertical flip (depth direction is not symmetric),
+        rotations / random crops / scaling (break depth+lateral semantics),
+        cutout/erasing (might delete the features the model needs), and any
+        cross-sequence mix (hard to interpret target).
+        """
+        # Horizontal flip: same flip across all frames.
+        if np.random.rand() < 0.5:
+            seq_imgs = [np.ascontiguousarray(np.flip(im, axis=2)) for im in seq_imgs]
+
+        # Brightness / contrast: same gain & bias across all frames.
+        if np.random.rand() < 0.5:
+            gain = np.random.uniform(0.9, 1.1)
+            bias = np.random.uniform(-0.05, 0.05)
+            seq_imgs = [np.clip(im * gain + bias, 0.0, 1.0).astype(np.float32) for im in seq_imgs]
+
+        # Light multiplicative speckle: independent noise per frame is OK —
+        # this matches real ultrasound where speckle decorrelates frame-to-frame.
+        if np.random.rand() < 0.3:
+            seq_imgs = [
+                np.clip(im * (1.0 + np.random.randn(*im.shape).astype(np.float32) * 0.05),
+                        0.0, 1.0)
+                for im in seq_imgs
+            ]
+
+        return seq_imgs
+
     def __getitem__(self, idx):
         meta = self.samples[idx]
         with h5py.File(meta['path'], 'r') as f:
@@ -260,7 +303,10 @@ class LargeUSDataset(Dataset):
             img = frames[i]
             img = cv2.resize(img, (256, 256))
             if img.max() > 1.0: img = img / 255.0
-            seq_imgs.append(np.expand_dims(img, axis=0))
+            seq_imgs.append(np.expand_dims(img, axis=0).astype(np.float32))
+
+        if self.augment:
+            seq_imgs = self._augment_sequence(seq_imgs)
 
         seq_tensor = torch.tensor(np.stack(seq_imgs), dtype=torch.float32)
         # Signed Δz — sign-from-IMU was unreliable; let the model learn direction.
