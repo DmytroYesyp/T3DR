@@ -155,22 +155,27 @@ class FiMANet(nn.Module):
         for layer in self.temporal_layers:
             features = layer(features)
 
-        last = features[:, -1, :]
+        # Multi-step output: apply heads to every temporal position. Training
+        # uses all positions for supervision (forecasting motion(p → p+1) at
+        # each p, masked for early positions with insufficient context).
+        # Inference reads only the last position [:, -1] — same semantics as
+        # the prior single-step setup, since position S-1 forecasts the next
+        # future motion exactly as the old model did.
 
         if self.predict_sign:
-            mag = self.head_mag(last)
-            sign_logit = self.head_sign(last)
+            mag = self.head_mag(features)         # [B, S, output_dim]
+            sign_logit = self.head_sign(features) # [B, S, output_dim]
             if self.output_dim == 1:
-                mag = mag.squeeze(-1)
+                mag = mag.squeeze(-1)             # [B, S]
                 sign_logit = sign_logit.squeeze(-1)
             return mag, sign_logit
 
-        out = self.head(last)
+        out = self.head(features)                 # [B, S, output_dim*(1 or 2)]
         if self.predict_uncertainty:
             mu = out[..., :self.output_dim]
             log_var = out[..., self.output_dim:]
             if self.output_dim == 1:
-                mu = mu.squeeze(-1)
+                mu = mu.squeeze(-1)               # [B, S]
                 log_var = log_var.squeeze(-1)
             return mu, log_var
         return out.squeeze(-1) if self.output_dim == 1 else out

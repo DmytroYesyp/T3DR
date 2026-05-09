@@ -185,32 +185,40 @@ class MotionWeightedHeteroscedasticLoss(nn.Module):
 class MotionWeightedTwoHeadLoss(nn.Module):
     """Magnitude L1 (motion-weighted) + binary cross-entropy on sign.
 
-    Sign labels for very small motion (|Δz| ≈ 0) are essentially noise — we
-    mask them out of the BCE term so the classifier isn't penalized for
-    coin-flipping on near-stationary frames.
-
-    Combined: total = mag_l1 + sign_weight * sign_bce
+    Now operates on multi-step outputs [B, S] — the model forecasts the next
+    motion at every temporal position. Two masks are applied:
+      • position mask: skip first `start_pos` positions where the SSM stack's
+        receptive field hasn't filled in yet (~5 frames).
+      • sign mask: skip frames where |Δz| ≤ sign_min_dz, since their sign
+        labels are essentially noise.
     Returns (total, mag_loss, sign_loss) so training can log both.
     """
-    def __init__(self, alpha=2.0, sign_weight=0.3, sign_min_dz=0.01):
+    def __init__(self, alpha=2.0, sign_weight=0.3, sign_min_dz=0.01, start_pos=5):
         super().__init__()
         self.alpha = alpha
         self.sign_weight = sign_weight
         self.sign_min_dz = sign_min_dz
+        self.start_pos = start_pos
         self.bce = nn.BCEWithLogitsLoss(reduction='none')
 
     def forward(self, mag_pred, sign_logit, target):
+        # All shapes: [B, S]
         target_abs = torch.abs(target)
         target_sign = (target > 0).float()
 
         mag_l1 = torch.abs(mag_pred - target_abs)
         mag_weight = 1.0 + self.alpha * target_abs
-        mag_loss = (mag_weight * mag_l1).mean()
 
-        sign_mask = (target_abs > self.sign_min_dz).float()
+        # Position mask: zeros for positions < start_pos, ones afterwards.
+        pos_mask = torch.zeros_like(target_abs)
+        pos_mask[:, self.start_pos:] = 1.0
+
+        mag_term = mag_weight * mag_l1 * pos_mask
+        mag_loss = mag_term.sum() / pos_mask.sum().clamp(min=1.0)
+
+        sign_mask = (target_abs > self.sign_min_dz).float() * pos_mask
         sign_bce = self.bce(sign_logit, target_sign) * sign_mask
-        denom = sign_mask.sum().clamp(min=1.0)
-        sign_loss = sign_bce.sum() / denom
+        sign_loss = sign_bce.sum() / sign_mask.sum().clamp(min=1.0)
 
         return mag_loss + self.sign_weight * sign_loss, mag_loss, sign_loss
 
@@ -309,8 +317,13 @@ class LargeUSDataset(Dataset):
             seq_imgs = self._augment_sequence(seq_imgs)
 
         seq_tensor = torch.tensor(np.stack(seq_imgs), dtype=torch.float32)
-        # Signed Δz — sign-from-IMU was unreliable; let the model learn direction.
-        target = torch.tensor(tforms[-1, 2, 3] - tforms[-2, 2, 3], dtype=torch.float32)
+        # Multi-step target: signed Δz at every input position p, where
+        # target[p] = z(p+1) - z(p) is the motion the model is asked to forecast
+        # given features [..., p]. Position S-1's target is the original
+        # next-future motion, so inference behavior at the last position is
+        # unchanged. Earlier positions provide additional supervision signal.
+        zs = tforms[:, 2, 3].astype(np.float32)            # [seq_len + 1]
+        target = torch.tensor(zs[1:] - zs[:-1], dtype=torch.float32)  # [seq_len]
 
         if self.use_imu:
             imu_data = self.imu_sim.generate(tforms)[:self.seq_len]
@@ -347,7 +360,9 @@ class MemoryUSDataset(Dataset):
         seq_tensor = torch.tensor(np.stack(seq_imgs), dtype=torch.float32)
 
         tforms = self.t[start : start + self.seq_len + 1]
-        target = torch.tensor(tforms[-1, 2, 3] - tforms[-2, 2, 3], dtype=torch.float32)
+        # Multi-step target — see LargeUSDataset comment.
+        zs = tforms[:, 2, 3].astype(np.float32)
+        target = torch.tensor(zs[1:] - zs[:-1], dtype=torch.float32)  # [seq_len]
 
         if self.use_imu:
             imu_data = self.imu_sim.generate(tforms)[:self.seq_len]
@@ -486,19 +501,20 @@ def train_model(run_name, run_dir, model_name, model, train_loader, val_loader, 
                 with autocast(device_type='cuda', dtype=torch.float16):
                     outputs = model(seqs, imu=imus)
                     if PREDICT_SIGN_TWO_HEAD:
-                        mag, sign_logit = outputs
+                        mag, sign_logit = outputs               # [B, S]
                         v_loss, _, _ = criterion(mag, sign_logit, targets)
-                        # Combined signed prediction so val MAE is comparable
-                        # to single-head signed regression baselines.
-                        signed_pred = mag * torch.tanh(sign_logit)
-                        v_mae = pure_l1(signed_pred, targets)
+                        # Val MAE on the LAST position only — matches the
+                        # single-step convention of prior runs (model's
+                        # forecast of the next motion given full window).
+                        signed_last = mag[:, -1] * torch.tanh(sign_logit[:, -1])
+                        v_mae = pure_l1(signed_last, targets[:, -1])
                     elif PREDICT_UNCERTAINTY:
-                        mu, log_var = outputs
+                        mu, log_var = outputs                   # [B, S]
                         v_loss = criterion(mu, log_var, targets)
-                        v_mae = pure_l1(mu, targets)
+                        v_mae = pure_l1(mu[:, -1], targets[:, -1])
                     else:
-                        v_loss = criterion(outputs, targets)
-                        v_mae = pure_l1(outputs, targets)
+                        v_loss = criterion(outputs, targets)    # [B, S]
+                        v_mae = pure_l1(outputs[:, -1], targets[:, -1])
                     val_loss += v_loss.item()
                     val_mae_sum += v_mae.item()
 
@@ -556,14 +572,18 @@ def predict_z_trajectory(model, frames, tforms, imu_verifier, start_idx=0, end_i
 
     def _model_signed_dz(out):
         """Resolve a single signed Δz scalar from any of the supported model
-        output shapes: two-head (mag, sign_logit) → mag·tanh(logit); hetero
-        (mu, log_var) → mu; plain regression → out."""
+        output shapes. With multi-step supervision the model returns [B, S]
+        tensors; we read only the last position (S-1), which forecasts the
+        next future motion — same semantics as the original single-step
+        convention.
+        """
         if use_two_head:
-            mag_t, sign_logit_t = out
-            return float((mag_t * torch.tanh(sign_logit_t)).item())
+            mag_t, sign_logit_t = out                                  # [B, S]
+            signed = mag_t[..., -1] * torch.tanh(sign_logit_t[..., -1])
+            return float(signed.item())
         if use_uncertainty:
-            return float(out[0].item())
-        return float(out.item())
+            return float(out[0][..., -1].item())                       # mu's last pos
+        return float(out[..., -1].item())                              # plain regression last pos
 
     if imu_verifier is not None:
         imu_full = imu_verifier.precompute_imu(tforms)
@@ -604,9 +624,9 @@ def predict_z_trajectory(model, frames, tforms, imu_verifier, start_idx=0, end_i
             out = model(inp)
             z_visual = _model_signed_dz(out)
             if use_uncertainty:
-                # log_var still available for any future σ-aware path; the
-                # verifier currently uses fixed σ regardless.
-                sigma_visual = float(torch.exp(0.5 * out[1]).item())
+                # log_var at last position; the verifier currently uses
+                # fixed σ regardless (use_fixed_sigma=True).
+                sigma_visual = float(torch.exp(0.5 * out[1][..., -1]).item())
             else:
                 sigma_visual = None
 
@@ -891,7 +911,7 @@ if __name__ == '__main__':
         best_model_path = args.eval_only
         print(f"[{get_time()}] --- EVAL-ONLY: skipping training, loading {best_model_path} ---")
     else:
-        train_ds = LargeUSDataset(TRAIN_FOLDERS, seq_len=SEQ_LEN, use_imu=USE_IMU)
+        train_ds = LargeUSDataset(TRAIN_FOLDERS, seq_len=SEQ_LEN, use_imu=USE_IMU, augment=True)
         train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=0)
         val_datasets = [
             MemoryUSDataset(fp, tp, seq_len=SEQ_LEN, use_imu=USE_IMU)
