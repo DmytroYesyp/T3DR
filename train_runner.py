@@ -31,7 +31,7 @@ EPOCHS = 10
 
 # In-model IMU fusion is OFF — IMU lives outside as a verifier (see below).
 USE_IMU = False
-WARMUP_EPOCHS = 2  # freeze layer2/3/4 for this many epochs
+WARMUP_EPOCHS = 4  # freeze layer2/3/4 for this many epochs
 
 # Eval-time IMU verifier settings
 USE_IMU_VERIFIER = True
@@ -44,6 +44,12 @@ PREDICT_SIGN_TWO_HEAD = True
 SIGN_LOSS_WEIGHT = 0.3       # λ in total = mag_l1 + λ * BCE(sign)
 SIGN_LABEL_MIN_DZ = 0.01     # mm — frames with |Δz| below this are masked
                               # from BCE since their sign is essentially noise
+# Pair encoder: explicit [f_curr | f_next - f_curr] features before the
+# temporal stack — strong inductive bias for motion estimation. Each pair
+# position encodes motion(p → p+1); output sequence has length SEQ_LEN - 1.
+# Inference uses the LAST pair, which predicts motion arriving at the last
+# frame in the window (not future motion as with the frame encoder).
+USE_PAIR_ENCODER = True
 
 BASE_DATA_DIR = "/home/123ghdh/datasets"
 TRAIN_FOLDERS = [os.path.join(BASE_DATA_DIR, str(i).zfill(3)) for i in range(50)]
@@ -401,6 +407,10 @@ def train_model(run_name, run_dir, model_name, model, train_loader, val_loader, 
     head_params = list(model.fusion.parameters()) + \
                   list(model.temporal_layers.parameters())
 
+    # Pair-encoder projection (only present when pair_encoder=True).
+    if getattr(model, 'pair_encoder', False):
+        head_params += list(model.pair_proj.parameters())
+
     # In two-head mode the regression head is split; otherwise there's a
     # single self.head sequential module.
     if getattr(model, 'predict_sign', False):
@@ -463,12 +473,18 @@ def train_model(run_name, run_dir, model_name, model, train_loader, val_loader, 
                 outputs = model(seqs, imu=imus)
                 if PREDICT_SIGN_TWO_HEAD:
                     mag, sign_logit = outputs
-                    loss, _, _ = criterion(mag, sign_logit, targets)
+                    # With pair encoder, model output is S-1 long; targets are
+                    # still S long. Pair p in the model corresponds to motion
+                    # (p → p+1) = targets[p], so we slice to the first S-1.
+                    tgt = targets[:, :mag.shape[1]] if mag.shape[1] < targets.shape[1] else targets
+                    loss, _, _ = criterion(mag, sign_logit, tgt)
                 elif PREDICT_UNCERTAINTY:
                     mu, log_var = outputs
-                    loss = criterion(mu, log_var, targets)
+                    tgt = targets[:, :mu.shape[1]] if mu.shape[1] < targets.shape[1] else targets
+                    loss = criterion(mu, log_var, tgt)
                 else:
-                    loss = criterion(outputs, targets)
+                    tgt = targets[:, :outputs.shape[1]] if outputs.shape[1] < targets.shape[1] else targets
+                    loss = criterion(outputs, tgt)
 
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
@@ -501,20 +517,29 @@ def train_model(run_name, run_dir, model_name, model, train_loader, val_loader, 
                 with autocast(device_type='cuda', dtype=torch.float16):
                     outputs = model(seqs, imu=imus)
                     if PREDICT_SIGN_TWO_HEAD:
-                        mag, sign_logit = outputs               # [B, S]
-                        v_loss, _, _ = criterion(mag, sign_logit, targets)
-                        # Val MAE on the LAST position only — matches the
-                        # single-step convention of prior runs (model's
-                        # forecast of the next motion given full window).
+                        mag, sign_logit = outputs               # [B, S or S-1]
+                        # Pair encoder: predictions are S-1 long, target last
+                        # pair = motion(S-2 → S-1) = targets[:, S-2].
+                        # Frame encoder: predictions are S long, target last
+                        # position = motion(S-1 → S) = targets[:, S-1].
+                        # Either way, the LAST element of preds aligns with
+                        # targets[:, mag.shape[1] - 1].
+                        last_idx = mag.shape[1] - 1
+                        tgt = targets[:, :mag.shape[1]]
+                        v_loss, _, _ = criterion(mag, sign_logit, tgt)
                         signed_last = mag[:, -1] * torch.tanh(sign_logit[:, -1])
-                        v_mae = pure_l1(signed_last, targets[:, -1])
+                        v_mae = pure_l1(signed_last, targets[:, last_idx])
                     elif PREDICT_UNCERTAINTY:
-                        mu, log_var = outputs                   # [B, S]
-                        v_loss = criterion(mu, log_var, targets)
-                        v_mae = pure_l1(mu[:, -1], targets[:, -1])
+                        mu, log_var = outputs
+                        last_idx = mu.shape[1] - 1
+                        tgt = targets[:, :mu.shape[1]]
+                        v_loss = criterion(mu, log_var, tgt)
+                        v_mae = pure_l1(mu[:, -1], targets[:, last_idx])
                     else:
-                        v_loss = criterion(outputs, targets)    # [B, S]
-                        v_mae = pure_l1(outputs[:, -1], targets[:, -1])
+                        last_idx = outputs.shape[1] - 1
+                        tgt = targets[:, :outputs.shape[1]]
+                        v_loss = criterion(outputs, tgt)
+                        v_mae = pure_l1(outputs[:, -1], targets[:, last_idx])
                     val_loss += v_loss.item()
                     val_mae_sum += v_mae.item()
 
@@ -561,14 +586,29 @@ def predict_z_trajectory(model, frames, tforms, imu_verifier, start_idx=0, end_i
     if end_idx is None: end_idx = len(frames)
     if end_idx - start_idx <= SEQ_LEN: return None, None
 
-    curr_z_pred = float(tforms[start_idx + SEQ_LEN - 1, 2, 3])
-    curr_z_real = float(tforms[start_idx + SEQ_LEN - 1, 2, 3])
+    use_uncertainty = getattr(model, 'predict_uncertainty', False)
+    use_two_head    = getattr(model, 'predict_sign', False)
+    use_pair        = getattr(model, 'pair_encoder', False)
+
+    # Pair encoder's last output predicts motion ARRIVING at the last frame
+    # in the window (motion(S-2 → S-1)). Frame encoder's last output predicts
+    # motion LEAVING (motion(S-1 → S), future). To cover the same trajectory
+    # transitions, the pair-encoder loop starts one trajectory frame earlier
+    # and runs one more iteration.
+    if use_pair:
+        init_frame = start_idx + SEQ_LEN - 2   # one earlier
+        loop_end   = end_idx - SEQ_LEN + 1
+        real_step_offset = SEQ_LEN - 1         # motion(t+S-2 → t+S-1)
+    else:
+        init_frame = start_idx + SEQ_LEN - 1
+        loop_end   = end_idx - SEQ_LEN
+        real_step_offset = SEQ_LEN             # motion(t+S-1 → t+S)
+
+    curr_z_pred = float(tforms[init_frame, 2, 3])
+    curr_z_real = float(tforms[init_frame, 2, 3])
 
     traj_pred = [curr_z_pred]
     traj_real = [curr_z_real]
-
-    use_uncertainty = getattr(model, 'predict_uncertainty', False)
-    use_two_head    = getattr(model, 'predict_sign', False)
 
     def _model_signed_dz(out):
         """Resolve a single signed Δz scalar from any of the supported model
@@ -588,7 +628,7 @@ def predict_z_trajectory(model, frames, tforms, imu_verifier, start_idx=0, end_i
     if imu_verifier is not None:
         imu_full = imu_verifier.precompute_imu(tforms)
         init_pos = np.array([0.0, 0.0, curr_z_pred], dtype=np.float64)
-        init_rot = tforms[start_idx + SEQ_LEN - 1, :3, :3].astype(np.float64)
+        init_rot = tforms[init_frame, :3, :3].astype(np.float64)
 
         # Bootstrap v_z by averaging the first N model predictions. A single
         # first-frame estimate was noisy enough to point v_z the wrong way on
@@ -611,7 +651,7 @@ def predict_z_trajectory(model, frames, tforms, imu_verifier, start_idx=0, end_i
         imu_verifier.reset(init_pos, init_rot, init_velocity=init_vel)
 
     with torch.no_grad():
-        for t in range(start_idx, end_idx - SEQ_LEN):
+        for t in range(start_idx, loop_end):
             seq_imgs = []
             for i in range(SEQ_LEN):
                 img = frames[t + i]
@@ -630,10 +670,14 @@ def predict_z_trajectory(model, frames, tforms, imu_verifier, start_idx=0, end_i
             else:
                 sigma_visual = None
 
-            real_step = tforms[t + SEQ_LEN, 2, 3] - tforms[t + SEQ_LEN - 1, 2, 3]
+            # Frame encoder: real_step_offset = SEQ_LEN → motion(t+S-1 → t+S)
+            # Pair encoder:  real_step_offset = SEQ_LEN-1 → motion(t+S-2 → t+S-1)
+            real_step = tforms[t + real_step_offset, 2, 3] - tforms[t + real_step_offset - 1, 2, 3]
 
             if imu_verifier is not None:
-                idx = t + SEQ_LEN - 1
+                # IMU sample aligned to the start of the transition the model
+                # is predicting (frame encoder: t+S-1, pair encoder: t+S-2).
+                idx = t + real_step_offset - 1
                 accel = imu_full[idx, :3]
                 gyro  = imu_full[idx, 3:]
                 signed_step = imu_verifier.step(accel, gyro, z_visual, sigma_visual)
@@ -923,7 +967,8 @@ if __name__ == '__main__':
         print(f"[{get_time()}] --- STEP 2: TRAIN FIMA-NET ---")
         fima_model = FiMANet(seq_len=SEQ_LEN, use_imu=USE_IMU,
                              predict_uncertainty=PREDICT_UNCERTAINTY,
-                             predict_sign=PREDICT_SIGN_TWO_HEAD)
+                             predict_sign=PREDICT_SIGN_TWO_HEAD,
+                             pair_encoder=USE_PAIR_ENCODER)
         fima_history, best_model_path = train_model(
             run_name, run_dir, "FiMA_UnfrozenBackbone", fima_model, train_loader, val_loader, EPOCHS, use_imu=USE_IMU
         )
@@ -935,7 +980,8 @@ if __name__ == '__main__':
     print(f"[{get_time()}] --- STEP 3: EVALUATE WITH IMU VERIFIER ---")
     eval_model = FiMANet(seq_len=SEQ_LEN, use_imu=USE_IMU,
                          predict_uncertainty=PREDICT_UNCERTAINTY,
-                         predict_sign=PREDICT_SIGN_TWO_HEAD).to(DEVICE)
+                         predict_sign=PREDICT_SIGN_TWO_HEAD,
+                         pair_encoder=USE_PAIR_ENCODER).to(DEVICE)
     eval_model = load_weights_safe(eval_model, best_model_path)
 
     imu_verifier = IMUVerifier(IMUSimulator()) if USE_IMU_VERIFIER else None

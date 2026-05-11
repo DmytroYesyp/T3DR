@@ -38,7 +38,8 @@ class TemporalSSMBlock(nn.Module):
 class FiMANet(nn.Module):
     def __init__(self, seq_len=10, hidden_size=256, num_layers=2,
                  use_imu=False, imu_channels=6, output_dim=1,
-                 predict_uncertainty=False, predict_sign=False):
+                 predict_uncertainty=False, predict_sign=False,
+                 pair_encoder=False):
         super().__init__()
         self.seq_len = seq_len
         self.use_imu = use_imu
@@ -50,6 +51,12 @@ class FiMANet(nn.Module):
         self.predict_sign = predict_sign
         if predict_sign and predict_uncertainty:
             raise ValueError("predict_sign and predict_uncertainty are mutually exclusive")
+        # Pair encoder: replace per-frame features with explicit pair-wise
+        # motion features [f_curr, f_next - f_curr] before the temporal stack.
+        # Strong inductive bias for motion estimation (similar to FlowNet's
+        # cost volume idea). Output length becomes seq_len - 1, with each
+        # position p encoding the transition from input frame p to p+1.
+        self.pair_encoder = pair_encoder
 
         # Backbone (ResNet-18)
         base_resnet = models.resnet18(weights='IMAGENET1K_V1')
@@ -93,6 +100,19 @@ class FiMANet(nn.Module):
                 nn.Sigmoid()
             )
 
+        # Pair projection: collapse [f_curr | f_next - f_curr] (2H) back to H.
+        # Initialized after pos_encoder/temporal_layers below so it doesn't
+        # interfere with the existing ImageNet-init feature dimensions.
+        if pair_encoder:
+            self.pair_proj = nn.Sequential(
+                nn.Linear(hidden_size * 2, hidden_size),
+                nn.LayerNorm(hidden_size),
+                nn.ReLU(),
+                nn.Dropout(0.2),
+            )
+
+        # Pair-encoder sequence is seq_len-1; positional encoding still works
+        # since the buffer is sliced to actual sequence length in forward.
         self.pos_encoder = PositionalEncoding(hidden_size, max_len=seq_len)
         self.temporal_layers = nn.ModuleList([
             TemporalSSMBlock(d_model=hidden_size) for _ in range(num_layers)
@@ -150,6 +170,15 @@ class FiMANet(nn.Module):
                 torch.cat([features, imu_feat], dim=-1)   # [B, S, 2*hidden]
             )                                              # [B, S, hidden]
             features = features + gate * imu_feat
+
+        # Pair encoding: replace per-frame features with explicit pair
+        # transitions. Each pair position p encodes motion(p → p+1) via
+        # [f_p | f_{p+1} - f_p]. Output length is seq_len - 1.
+        if self.pair_encoder:
+            f_curr = features[:, :-1, :]                       # [B, S-1, H]
+            f_next = features[:, 1:, :]                        # [B, S-1, H]
+            pair_features = torch.cat([f_curr, f_next - f_curr], dim=-1)  # [B, S-1, 2H]
+            features = self.pair_proj(pair_features)           # [B, S-1, H]
 
         features = self.pos_encoder(features)
         for layer in self.temporal_layers:
