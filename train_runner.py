@@ -20,6 +20,7 @@ from models.fimanet import FiMANet
 from models.moglonet import MoGLoNet
 from lib.imu_simulator import IMUSimulator
 from lib.imu_verifier import IMUVerifier
+from lib.complementary_filter import ComplementaryFilter
 
 # =============================================================================
 # CONFIG
@@ -582,7 +583,14 @@ def calculate_metrics(z_pred, z_real):
     fdr = (final_drift / total_length) * 100 if total_length > 0 else float('inf')
     return mae, final_drift, total_length, fdr
 
-def predict_z_trajectory(model, frames, tforms, imu_verifier, start_idx=0, end_idx=None):
+def predict_z_trajectory(model, frames, tforms, imu_verifier, start_idx=0, end_idx=None,
+                         use_tta=False):
+    """Predict signed Z trajectory frame-by-frame.
+
+    use_tta: if True, average model outputs over the input and its horizontally
+    flipped version. Z-axis motion is invariant to lateral flip, so the flip
+    averaging reduces sign-flip variance without biasing the prediction.
+    """
     if end_idx is None: end_idx = len(frames)
     if end_idx - start_idx <= SEQ_LEN: return None, None
 
@@ -609,6 +617,25 @@ def predict_z_trajectory(model, frames, tforms, imu_verifier, start_idx=0, end_i
 
     traj_pred = [curr_z_pred]
     traj_real = [curr_z_real]
+
+    def _forward(inp):
+        """Forward with optional horizontal-flip TTA. Returns a tensor (or tuple)
+        of the same shape as a normal forward — head outputs are pre-averaged
+        across the original and flipped inputs when use_tta is on."""
+        out = model(inp)
+        if not use_tta:
+            return out
+        inp_flipped = torch.flip(inp, dims=[-1])
+        out_flipped = model(inp_flipped)
+        if use_two_head:
+            mag = (out[0] + out_flipped[0]) / 2
+            sign_logit = (out[1] + out_flipped[1]) / 2
+            return (mag, sign_logit)
+        if use_uncertainty:
+            mu = (out[0] + out_flipped[0]) / 2
+            log_var = (out[1] + out_flipped[1]) / 2
+            return (mu, log_var)
+        return (out + out_flipped) / 2
 
     def _model_signed_dz(out):
         """Resolve a single signed Δz scalar from any of the supported model
@@ -645,7 +672,7 @@ def predict_z_trajectory(model, frames, tforms, imu_verifier, start_idx=0, end_i
                 seq_imgs.append(np.expand_dims(img, axis=0))
             inp = torch.tensor(np.stack(seq_imgs), dtype=torch.float32).unsqueeze(0).to(DEVICE)
             with torch.no_grad():
-                init_dzs.append(_model_signed_dz(model(inp)))
+                init_dzs.append(_model_signed_dz(_forward(inp)))
         first_dz = float(np.mean(init_dzs))
         init_vel = np.array([0.0, 0.0, first_dz / imu_verifier.dt], dtype=np.float64)
         imu_verifier.reset(init_pos, init_rot, init_velocity=init_vel)
@@ -661,7 +688,7 @@ def predict_z_trajectory(model, frames, tforms, imu_verifier, start_idx=0, end_i
 
             inp = torch.tensor(np.stack(seq_imgs), dtype=torch.float32).unsqueeze(0).to(DEVICE)
 
-            out = model(inp)
+            out = _forward(inp)
             z_visual = _model_signed_dz(out)
             if use_uncertainty:
                 # log_var at last position; the verifier currently uses
@@ -742,10 +769,24 @@ def plot_z_trajectory(z_pred, z_real, title, filename, using_imu):
     plt.close()
     print(f"[{get_time()}] Saved Z-plot: {filename}")
 
-def run_evaluation(run_name, run_dir, val_dir, model, imu_verifier, val_pairs):
+def _filter_label(imu_verifier):
+    """Human-readable label for the filter currently wired in."""
+    if imu_verifier is None:
+        return "DISABLED (visual-only)"
+    cls = imu_verifier.__class__.__name__
+    if cls == 'IMUVerifier':
+        sigma = getattr(imu_verifier, 'default_visual_sigma', None)
+        return f"ENABLED (ESKF, σ={sigma})"
+    if cls == 'ComplementaryFilter':
+        a = getattr(imu_verifier, 'alpha', None)
+        return f"ENABLED (Complementary, α={a})"
+    return f"ENABLED ({cls})"
+
+
+def run_evaluation(run_name, run_dir, val_dir, model, imu_verifier, val_pairs, use_tta=False):
     print(f"\n{'='*50}")
     print(f"[{get_time()}] EVALUATION PHASE")
-    print(f"[{get_time()}] IMU Verifier: {'ENABLED (ESKF)' if imu_verifier else 'DISABLED'}")
+    print(f"[{get_time()}] IMU Verifier: {_filter_label(imu_verifier)}")
     print(f"{'='*50}")
 
     # ---------- PART 1: Per-case validation analysis ----------
@@ -756,7 +797,7 @@ def run_evaluation(run_name, run_dir, val_dir, model, imu_verifier, val_pairs):
             with h5py.File(frames_path, 'r') as f_f, h5py.File(tforms_path, 'r') as f_t:
                 v_frames = f_f['frames'][:]
                 v_tforms = f_t['tforms'][:]
-            z_pred, z_real = predict_z_trajectory(model, v_frames, v_tforms, imu_verifier)
+            z_pred, z_real = predict_z_trajectory(model, v_frames, v_tforms, imu_verifier, use_tta=use_tta)
             if z_pred is None:
                 continue
             mae, drift, length, fdr = calculate_metrics(z_pred, z_real)
@@ -834,7 +875,7 @@ def run_evaluation(run_name, run_dir, val_dir, model, imu_verifier, val_pairs):
                 frames = f['frames'][:]
                 tforms = f['tforms'][:]
 
-            z_p, z_r = predict_z_trajectory(model, frames, tforms, imu_verifier)
+            z_p, z_r = predict_z_trajectory(model, frames, tforms, imu_verifier, use_tta=use_tta)
             if z_p is None: continue
 
             mae, drift, length, fdr = calculate_metrics(z_p, z_r)
@@ -867,7 +908,7 @@ def run_evaluation(run_name, run_dir, val_dir, model, imu_verifier, val_pairs):
     summary_text = (
         f"=== EVALUATION METRICS (FiMA-Net) ===\n"
         f"Run tag:             {run_name}\n"
-        f"IMU Verifier:        {'ENABLED (ESKF)' if imu_verifier else 'DISABLED'}\n"
+        f"IMU Verifier:        {_filter_label(imu_verifier)}\n"
         f"\n"
         f"--- Validation set ({len(val_results)} cases) ---\n"
         f"Validation MAE:      {val_avg_mae:.3f} mm (avg)\n"
@@ -921,6 +962,18 @@ if __name__ == '__main__':
                         help='Run name base tag (auto-suffixed with _v{N}). Defaults to a config-derived tag.')
     parser.add_argument('--eval-only', '-e', default=None, metavar='CKPT',
                         help='Skip training; load this .pth checkpoint and run evaluation only.')
+    parser.add_argument('--sigma', '-s', type=float, default=None, metavar='SIGMA',
+                        help='Override IMUVerifier default_visual_sigma (mm). Was 0.3 by default; '
+                             'tighter values (0.1-0.2) suit better per-frame predictions.')
+    parser.add_argument('--tta', action='store_true',
+                        help='Enable horizontal-flip test-time augmentation at inference. '
+                             'Doubles the per-frame forward cost but reduces sign-flip variance.')
+    parser.add_argument('--filter', '-f', choices=['eskf', 'complementary', 'none'], default=None,
+                        help='Override fusion filter at inference. eskf = ESKF (current default), '
+                             'complementary = simple α-blend baseline, none = visual-only sum.')
+    parser.add_argument('--alpha', '-a', type=float, default=0.2, metavar='ALPHA',
+                        help='Complementary filter blending coefficient (only used with --filter complementary). '
+                             '0 = pure visual, 1 = pure IMU dead-reckoning.')
     args = parser.parse_args()
 
     print(f"[{get_time()}] --- STEP 1: PREPARING DATASETS ---")
@@ -984,8 +1037,32 @@ if __name__ == '__main__':
                          pair_encoder=USE_PAIR_ENCODER).to(DEVICE)
     eval_model = load_weights_safe(eval_model, best_model_path)
 
-    imu_verifier = IMUVerifier(IMUSimulator()) if USE_IMU_VERIFIER else None
-    run_evaluation(run_name, run_dir, val_dir, eval_model, imu_verifier, val_pairs)
+    # Filter selection: CLI --filter overrides the USE_IMU_VERIFIER config.
+    if args.filter is not None:
+        filter_type = args.filter
+    else:
+        filter_type = 'eskf' if USE_IMU_VERIFIER else 'none'
+
+    if filter_type == 'eskf':
+        # σ override: --sigma 0.15 (or any) takes precedence over the verifier default.
+        imu_verifier_kwargs = {}
+        if args.sigma is not None:
+            imu_verifier_kwargs['default_visual_sigma'] = float(args.sigma)
+            print(f"[{get_time()}] IMU verifier σ overridden via CLI: {args.sigma} mm")
+        imu_verifier = IMUVerifier(IMUSimulator(), **imu_verifier_kwargs)
+        print(f"[{get_time()}] Filter: ESKF (15-state error-state Kalman)")
+    elif filter_type == 'complementary':
+        imu_verifier = ComplementaryFilter(IMUSimulator(), alpha=float(args.alpha))
+        print(f"[{get_time()}] Filter: Complementary (α={args.alpha})")
+    else:
+        imu_verifier = None
+        print(f"[{get_time()}] Filter: NONE (visual-only sum)")
+
+    if args.tta:
+        print(f"[{get_time()}] TTA: hflip averaging ENABLED")
+
+    run_evaluation(run_name, run_dir, val_dir, eval_model, imu_verifier, val_pairs,
+                   use_tta=args.tta)
 
     del eval_model
     if fima_model is not None:
