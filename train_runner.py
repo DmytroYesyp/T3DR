@@ -583,8 +583,29 @@ def calculate_metrics(z_pred, z_real):
     fdr = (final_drift / total_length) * 100 if total_length > 0 else float('inf')
     return mae, final_drift, total_length, fdr
 
+def _smooth_trajectory(traj, window):
+    """Centered moving-average smoother on the per-step Δz sequence, then
+    reaccumulate. Preserves the trajectory's start point. Reduces the impact
+    of single-frame spikes (the failure mode behind the 052/Par_C_PtD outlier
+    in the visual-only ablation) without changing model weights.
+
+    Pure numpy; no scipy dependency.
+    """
+    traj = np.asarray(traj, dtype=np.float64)
+    if window <= 1 or len(traj) < window + 2:
+        return traj
+    if window % 2 == 0:
+        window += 1
+    steps = np.diff(traj)
+    kernel = np.ones(window, dtype=np.float64) / window
+    # 'same' pads with zeros at the edges; for trajectories of length 400+
+    # this only biases the first/last ~window/2 steps, which is negligible.
+    smoothed = np.convolve(steps, kernel, mode='same')
+    return np.concatenate([traj[:1], traj[0] + np.cumsum(smoothed)])
+
+
 def predict_z_trajectory(model, frames, tforms, imu_verifier, start_idx=0, end_idx=None,
-                         use_tta=False):
+                         use_tta=False, smooth_window=0):
     """Predict signed Z trajectory frame-by-frame.
 
     use_tta: if True, average model outputs over the input and its horizontally
@@ -717,7 +738,10 @@ def predict_z_trajectory(model, frames, tforms, imu_verifier, start_idx=0, end_i
             traj_pred.append(curr_z_pred)
             traj_real.append(curr_z_real)
 
-    return np.array(traj_pred), np.array(traj_real)
+    pred_arr = np.array(traj_pred)
+    if smooth_window and smooth_window > 1:
+        pred_arr = _smooth_trajectory(pred_arr, smooth_window)
+    return pred_arr, np.array(traj_real)
 
 def calculate_visual_odometry_2d(frames):
     feature_params = dict(maxCorners=200, qualityLevel=0.01, minDistance=7, blockSize=7)
@@ -783,7 +807,8 @@ def _filter_label(imu_verifier):
     return f"ENABLED ({cls})"
 
 
-def run_evaluation(run_name, run_dir, val_dir, model, imu_verifier, val_pairs, use_tta=False):
+def run_evaluation(run_name, run_dir, val_dir, model, imu_verifier, val_pairs,
+                   use_tta=False, smooth_window=0):
     print(f"\n{'='*50}")
     print(f"[{get_time()}] EVALUATION PHASE")
     print(f"[{get_time()}] IMU Verifier: {_filter_label(imu_verifier)}")
@@ -797,7 +822,8 @@ def run_evaluation(run_name, run_dir, val_dir, model, imu_verifier, val_pairs, u
             with h5py.File(frames_path, 'r') as f_f, h5py.File(tforms_path, 'r') as f_t:
                 v_frames = f_f['frames'][:]
                 v_tforms = f_t['tforms'][:]
-            z_pred, z_real = predict_z_trajectory(model, v_frames, v_tforms, imu_verifier, use_tta=use_tta)
+            z_pred, z_real = predict_z_trajectory(model, v_frames, v_tforms, imu_verifier,
+                                                  use_tta=use_tta, smooth_window=smooth_window)
             if z_pred is None:
                 continue
             mae, drift, length, fdr = calculate_metrics(z_pred, z_real)
@@ -875,7 +901,8 @@ def run_evaluation(run_name, run_dir, val_dir, model, imu_verifier, val_pairs, u
                 frames = f['frames'][:]
                 tforms = f['tforms'][:]
 
-            z_p, z_r = predict_z_trajectory(model, frames, tforms, imu_verifier, use_tta=use_tta)
+            z_p, z_r = predict_z_trajectory(model, frames, tforms, imu_verifier,
+                                            use_tta=use_tta, smooth_window=smooth_window)
             if z_p is None: continue
 
             mae, drift, length, fdr = calculate_metrics(z_p, z_r)
@@ -974,6 +1001,10 @@ if __name__ == '__main__':
     parser.add_argument('--alpha', '-a', type=float, default=0.2, metavar='ALPHA',
                         help='Complementary filter blending coefficient (only used with --filter complementary). '
                              '0 = pure visual, 1 = pure IMU dead-reckoning.')
+    parser.add_argument('--smooth', type=int, default=0, metavar='WINDOW',
+                        help='Post-process predicted trajectory with a centered moving-average '
+                             'smoother (window must be odd; 0 = off). Targets noisy-frame outliers. '
+                             'Try 5 or 7.')
     args = parser.parse_args()
 
     print(f"[{get_time()}] --- STEP 1: PREPARING DATASETS ---")
@@ -1061,8 +1092,13 @@ if __name__ == '__main__':
     if args.tta:
         print(f"[{get_time()}] TTA: hflip averaging ENABLED")
 
+    if args.smooth > 0:
+        if args.smooth % 2 == 0:
+            args.smooth += 1   # force odd for symmetric window
+        print(f"[{get_time()}] Trajectory smoothing: moving-average window={args.smooth}")
+
     run_evaluation(run_name, run_dir, val_dir, eval_model, imu_verifier, val_pairs,
-                   use_tta=args.tta)
+                   use_tta=args.tta, smooth_window=args.smooth)
 
     del eval_model
     if fima_model is not None:
