@@ -39,24 +39,28 @@ class FiMANet(nn.Module):
     def __init__(self, seq_len=10, hidden_size=256, num_layers=2,
                  use_imu=False, imu_channels=6, output_dim=1,
                  predict_uncertainty=False, predict_sign=False,
-                 pair_encoder=False):
+                 pair_encoder=False, pair_strides=(1,)):
         super().__init__()
         self.seq_len = seq_len
         self.use_imu = use_imu
         self.output_dim = output_dim
         self.predict_uncertainty = predict_uncertainty
-        # Two-head mode: regress |Δz| and classify sign(Δz) separately.
-        # Decouples directional bias (single signed regression had it baked in)
-        # from magnitude noise. Mutually exclusive with predict_uncertainty.
+        # Two-head: separate |Δz| regression from sign classification.
         self.predict_sign = predict_sign
         if predict_sign and predict_uncertainty:
             raise ValueError("predict_sign and predict_uncertainty are mutually exclusive")
-        # Pair encoder: replace per-frame features with explicit pair-wise
-        # motion features [f_curr, f_next - f_curr] before the temporal stack.
-        # Strong inductive bias for motion estimation (similar to FlowNet's
-        # cost volume idea). Output length becomes seq_len - 1, with each
-        # position p encoding the transition from input frame p to p+1.
+        # Pair encoder: [f_curr | Δ_s1 | Δ_s2 | ...] before the temporal stack.
+        # Multi-scale strides capture motion at multiple temporal gaps.
         self.pair_encoder = pair_encoder
+        self.pair_strides = tuple(int(s) for s in pair_strides) if pair_encoder else ()
+        if pair_encoder:
+            if not self.pair_strides:
+                raise ValueError("pair_encoder=True requires at least one stride")
+            if min(self.pair_strides) < 1:
+                raise ValueError("pair_strides must be positive")
+        self._pair_max_stride = max(self.pair_strides) if self.pair_strides else 0
+        # Shift the target slice so the last output aligns with motion(S-2 → S-1).
+        self.pair_target_offset = max(0, self._pair_max_stride - 1)
 
         # Backbone (ResNet-18)
         base_resnet = models.resnet18(weights='IMAGENET1K_V1')
@@ -100,28 +104,22 @@ class FiMANet(nn.Module):
                 nn.Sigmoid()
             )
 
-        # Pair projection: collapse [f_curr | f_next - f_curr] (2H) back to H.
-        # Initialized after pos_encoder/temporal_layers below so it doesn't
-        # interfere with the existing ImageNet-init feature dimensions.
         if pair_encoder:
+            in_dim = hidden_size * (1 + len(self.pair_strides))
             self.pair_proj = nn.Sequential(
-                nn.Linear(hidden_size * 2, hidden_size),
+                nn.Linear(in_dim, hidden_size),
                 nn.LayerNorm(hidden_size),
                 nn.ReLU(),
                 nn.Dropout(0.2),
             )
 
-        # Pair-encoder sequence is seq_len-1; positional encoding still works
-        # since the buffer is sliced to actual sequence length in forward.
         self.pos_encoder = PositionalEncoding(hidden_size, max_len=seq_len)
         self.temporal_layers = nn.ModuleList([
             TemporalSSMBlock(d_model=hidden_size) for _ in range(num_layers)
         ])
 
         if predict_sign:
-            # Two heads sharing the same temporal features. Splitting after
-            # the temporal stack (rather than the backbone) lets both tasks
-            # benefit from the same motion-context features.
+            # Two heads share the temporal features.
             self.head_mag = nn.Sequential(
                 nn.Linear(hidden_size, 64),
                 nn.ReLU(),
@@ -162,8 +160,7 @@ class FiMANet(nn.Module):
         features = self.fusion(combined)
         features = features.view(b, s, -1)
 
-        # Gated additive fusion: features = visual + gate * imu
-        # Visual pathway is always preserved; IMU adds supplementary info.
+        # Gated additive fusion with IMU.
         if self.use_imu and imu is not None:
             imu_feat = self.imu_encoder(imu)              # [B, S, hidden]
             gate = self.fusion_gate(
@@ -171,26 +168,24 @@ class FiMANet(nn.Module):
             )                                              # [B, S, hidden]
             features = features + gate * imu_feat
 
-        # Pair encoding: replace per-frame features with explicit pair
-        # transitions. Each pair position p encodes motion(p → p+1) via
-        # [f_p | f_{p+1} - f_p]. Output length is seq_len - 1.
+        # Pair encoding: [f_p | Δ_s1 | Δ_s2 | ...], output length S - max_stride.
         if self.pair_encoder:
-            f_curr = features[:, :-1, :]                       # [B, S-1, H]
-            f_next = features[:, 1:, :]                        # [B, S-1, H]
-            pair_features = torch.cat([f_curr, f_next - f_curr], dim=-1)  # [B, S-1, 2H]
-            features = self.pair_proj(pair_features)           # [B, S-1, H]
+            S = features.shape[1]
+            ms = self._pair_max_stride
+            L = S - ms                                          # output length
+            f_curr = features[:, :L, :]                         # [B, L, H]
+            parts = [f_curr]
+            for s in self.pair_strides:
+                f_far = features[:, s:s + L, :]                 # [B, L, H]
+                parts.append(f_far - f_curr)
+            pair_features = torch.cat(parts, dim=-1)            # [B, L, (1+n)*H]
+            features = self.pair_proj(pair_features)            # [B, L, H]
 
         features = self.pos_encoder(features)
         for layer in self.temporal_layers:
             features = layer(features)
 
-        # Multi-step output: apply heads to every temporal position. Training
-        # uses all positions for supervision (forecasting motion(p → p+1) at
-        # each p, masked for early positions with insufficient context).
-        # Inference reads only the last position [:, -1] — same semantics as
-        # the prior single-step setup, since position S-1 forecasts the next
-        # future motion exactly as the old model did.
-
+        # Heads emit one prediction per temporal position; inference reads [:, -1].
         if self.predict_sign:
             mag = self.head_mag(features)         # [B, S, output_dim]
             sign_logit = self.head_sign(features) # [B, S, output_dim]

@@ -37,20 +37,14 @@ WARMUP_EPOCHS = 4  # freeze layer2/3/4 for this many epochs
 # Eval-time IMU verifier settings
 USE_IMU_VERIFIER = True
 PREDICT_UNCERTAINTY = False
-# Two-head: |Δz| regression + binary sign classification. Single-head signed
-# regression plateaued (val MAE ~0.14 mm, severe FDR on *_L_DtP cases) due to
-# a directional bias the model can't unlearn. Decoupling magnitude from
-# direction lets each head specialize.
+# Two-head: separate |Δz| regression from binary sign classification.
 PREDICT_SIGN_TWO_HEAD = True
 SIGN_LOSS_WEIGHT = 0.3       # λ in total = mag_l1 + λ * BCE(sign)
-SIGN_LABEL_MIN_DZ = 0.01     # mm — frames with |Δz| below this are masked
-                              # from BCE since their sign is essentially noise
-# Pair encoder: explicit [f_curr | f_next - f_curr] features before the
-# temporal stack — strong inductive bias for motion estimation. Each pair
-# position encodes motion(p → p+1); output sequence has length SEQ_LEN - 1.
-# Inference uses the LAST pair, which predicts motion arriving at the last
-# frame in the window (not future motion as with the frame encoder).
+SIGN_LABEL_MIN_DZ = 0.01     # mm — mask BCE on near-stationary frames
+# Pair encoder: explicit [f_curr | Δ_s1 | Δ_s2 | ...] before the temporal stack.
 USE_PAIR_ENCODER = True
+# Multi-scale strides; output length becomes SEQ_LEN - max(strides).
+PAIR_STRIDES = (1, 2)
 
 BASE_DATA_DIR = "/home/123ghdh/datasets"
 TRAIN_FOLDERS = [os.path.join(BASE_DATA_DIR, str(i).zfill(3)) for i in range(50)]
@@ -94,13 +88,8 @@ def set_backbone_trainable(model, trainable):
             p.requires_grad = trainable
 
 def collect_last_n_val_files(n=VAL_LAST_N):
-    """Last n (frames_path, tforms_path, case_name) triples from VAL_FRAMES_ROOT,
-    sorted by subject then filename. Tolerant of missing tform pairs and a
-    flat (no-subject-subdir) layout.
-
-    NOTE: Kept for backward compatibility. Prefer collect_val_files_stratified
-    so the validation signal isn't dominated by a single subject.
-    """
+    """Last n val triples sorted by subject/filename. Kept for compatibility;
+    prefer collect_val_files_stratified to avoid single-subject domination."""
     pairs = []
     if not os.path.isdir(VAL_FRAMES_ROOT):
         return pairs
@@ -118,11 +107,7 @@ def collect_last_n_val_files(n=VAL_LAST_N):
 
 
 def collect_val_files_stratified(n_per_subject=4):
-    """Take n_per_subject scans from EACH validation subject. Avoids the
-    pathology where the previous 'last 10 alphabetically' selector was
-    monovariate (all from the alphabetically-last subject), making
-    cross-subject generalization invisible to the val signal.
-    """
+    """Take n_per_subject scans from each validation subject."""
     pairs = []
     if not os.path.isdir(VAL_FRAMES_ROOT):
         return pairs
@@ -171,10 +156,7 @@ class MotionWeightedL1Loss(nn.Module):
 
 
 class MotionWeightedHeteroscedasticLoss(nn.Module):
-    """Gaussian NLL on (μ, log σ²) with the same motion-weighted prior.
-    Lets the network predict its own per-frame σ — the ESKF reads σ as
-    measurement noise so the filter trusts confident frames more.
-    """
+    """Gaussian NLL on (μ, log σ²) with motion-weighted prior."""
     def __init__(self, alpha=2.0, log_var_min=-6.0, log_var_max=6.0):
         super().__init__()
         self.alpha = alpha
@@ -190,16 +172,8 @@ class MotionWeightedHeteroscedasticLoss(nn.Module):
 
 
 class MotionWeightedTwoHeadLoss(nn.Module):
-    """Magnitude L1 (motion-weighted) + binary cross-entropy on sign.
-
-    Now operates on multi-step outputs [B, S] — the model forecasts the next
-    motion at every temporal position. Two masks are applied:
-      • position mask: skip first `start_pos` positions where the SSM stack's
-        receptive field hasn't filled in yet (~5 frames).
-      • sign mask: skip frames where |Δz| ≤ sign_min_dz, since their sign
-        labels are essentially noise.
-    Returns (total, mag_loss, sign_loss) so training can log both.
-    """
+    """Magnitude L1 (motion-weighted) + BCE on sign, masked at low |Δz| and
+    early positions; returns (total, mag_loss, sign_loss)."""
     def __init__(self, alpha=2.0, sign_weight=0.3, sign_min_dz=0.01, start_pos=5):
         super().__init__()
         self.alpha = alpha
@@ -209,14 +183,12 @@ class MotionWeightedTwoHeadLoss(nn.Module):
         self.bce = nn.BCEWithLogitsLoss(reduction='none')
 
     def forward(self, mag_pred, sign_logit, target):
-        # All shapes: [B, S]
         target_abs = torch.abs(target)
         target_sign = (target > 0).float()
 
         mag_l1 = torch.abs(mag_pred - target_abs)
         mag_weight = 1.0 + self.alpha * target_abs
 
-        # Position mask: zeros for positions < start_pos, ones afterwards.
         pos_mask = torch.zeros_like(target_abs)
         pos_mask[:, self.start_pos:] = 1.0
 
@@ -255,8 +227,7 @@ class LargeUSDataset(Dataset):
                         if 'frames' not in f or 'tforms' not in f: continue
                         n_frames = f['frames'].shape[0]
 
-                        # No motion filter — model must see full dz distribution.
-                        # Step=2 gives 2x more samples than the old step=4.
+                        # Stride 2 — no motion filter so the model sees the full dz distribution.
                         for i in range(0, n_frames - seq_len, 2):
                             self.samples.append({'path': filepath, 'start': i})
                 except Exception as e:
@@ -269,35 +240,17 @@ class LargeUSDataset(Dataset):
 
     @staticmethod
     def _augment_sequence(seq_imgs):
-        """Conservative ultrasound-appropriate augmentation, applied identically
-        to every frame in the sequence so temporal coherence (and therefore the
-        Δz target) is preserved.
-
-        Included:
-          • Horizontal flip (p=0.5): probe scan plane is symmetric in x; lateral
-            flip preserves z-axis motion semantics.
-          • Brightness/contrast jitter (p=0.5, ±10%): mimics gain variation
-            across acquisitions on the same machine.
-          • Light multiplicative speckle (p=0.3, σ=0.05): matches ultrasound
-            noise model; light enough not to obliterate texture cues.
-
-        Deliberately omitted: vertical flip (depth direction is not symmetric),
-        rotations / random crops / scaling (break depth+lateral semantics),
-        cutout/erasing (might delete the features the model needs), and any
-        cross-sequence mix (hard to interpret target).
-        """
-        # Horizontal flip: same flip across all frames.
+        """Hflip / brightness-contrast / speckle, applied identically across
+        the sequence to preserve temporal coherence."""
         if np.random.rand() < 0.5:
             seq_imgs = [np.ascontiguousarray(np.flip(im, axis=2)) for im in seq_imgs]
 
-        # Brightness / contrast: same gain & bias across all frames.
         if np.random.rand() < 0.5:
             gain = np.random.uniform(0.9, 1.1)
             bias = np.random.uniform(-0.05, 0.05)
             seq_imgs = [np.clip(im * gain + bias, 0.0, 1.0).astype(np.float32) for im in seq_imgs]
 
-        # Light multiplicative speckle: independent noise per frame is OK —
-        # this matches real ultrasound where speckle decorrelates frame-to-frame.
+        # Speckle is independent per frame — real US speckle decorrelates frame-to-frame.
         if np.random.rand() < 0.3:
             seq_imgs = [
                 np.clip(im * (1.0 + np.random.randn(*im.shape).astype(np.float32) * 0.05),
@@ -324,11 +277,7 @@ class LargeUSDataset(Dataset):
             seq_imgs = self._augment_sequence(seq_imgs)
 
         seq_tensor = torch.tensor(np.stack(seq_imgs), dtype=torch.float32)
-        # Multi-step target: signed Δz at every input position p, where
-        # target[p] = z(p+1) - z(p) is the motion the model is asked to forecast
-        # given features [..., p]. Position S-1's target is the original
-        # next-future motion, so inference behavior at the last position is
-        # unchanged. Earlier positions provide additional supervision signal.
+        # Per-position target[p] = z(p+1) - z(p).
         zs = tforms[:, 2, 3].astype(np.float32)            # [seq_len + 1]
         target = torch.tensor(zs[1:] - zs[:-1], dtype=torch.float32)  # [seq_len]
 
@@ -367,7 +316,6 @@ class MemoryUSDataset(Dataset):
         seq_tensor = torch.tensor(np.stack(seq_imgs), dtype=torch.float32)
 
         tforms = self.t[start : start + self.seq_len + 1]
-        # Multi-step target — see LargeUSDataset comment.
         zs = tforms[:, 2, 3].astype(np.float32)
         target = torch.tensor(zs[1:] - zs[:-1], dtype=torch.float32)  # [seq_len]
 
@@ -408,12 +356,9 @@ def train_model(run_name, run_dir, model_name, model, train_loader, val_loader, 
     head_params = list(model.fusion.parameters()) + \
                   list(model.temporal_layers.parameters())
 
-    # Pair-encoder projection (only present when pair_encoder=True).
     if getattr(model, 'pair_encoder', False):
         head_params += list(model.pair_proj.parameters())
 
-    # In two-head mode the regression head is split; otherwise there's a
-    # single self.head sequential module.
     if getattr(model, 'predict_sign', False):
         head_params += list(model.head_mag.parameters())
         head_params += list(model.head_sign.parameters())
@@ -425,9 +370,6 @@ def train_model(run_name, run_dir, model_name, model, train_loader, val_loader, 
         head_params += list(model.fusion_gate.parameters())
 
     optimizer = torch.optim.Adam([
-        # 1e-5 destabilized post-unfreeze on the prior 4-epoch run (val NLL went
-        # from -1.19 to -0.70 at Ep4); halving it tames that without crippling
-        # adaptation of the ResNet features.
         {'params': backbone_params, 'lr': 5e-6},
         {'params': head_params, 'lr': 1e-4}
     ], weight_decay=1e-5)
@@ -446,8 +388,7 @@ def train_model(run_name, run_dir, model_name, model, train_loader, val_loader, 
     scaler = GradScaler('cuda')
 
     history = {'train': [], 'val': []}
-    # Track best by val MAE (the L1 we care about) instead of val NLL —
-    # heteroscedastic NLL can drop while MAE worsens if log_var overfits.
+    # Best by val MAE rather than val loss — NLL is poisoned by log_var overfit.
     best_val_mae = float('inf')
     best_model_path = os.path.join(run_dir, f"{run_name}_best.pth")
     total_batches = len(train_loader)
@@ -472,19 +413,21 @@ def train_model(run_name, run_dir, model_name, model, train_loader, val_loader, 
             optimizer.zero_grad()
             with autocast(device_type='cuda', dtype=torch.float16):
                 outputs = model(seqs, imu=imus)
+                # Slice targets so the last output aligns with motion(S-2 → S-1).
+                tgt_offset = getattr(model, 'pair_target_offset', 0)
                 if PREDICT_SIGN_TWO_HEAD:
                     mag, sign_logit = outputs
-                    # With pair encoder, model output is S-1 long; targets are
-                    # still S long. Pair p in the model corresponds to motion
-                    # (p → p+1) = targets[p], so we slice to the first S-1.
-                    tgt = targets[:, :mag.shape[1]] if mag.shape[1] < targets.shape[1] else targets
+                    L = mag.shape[1]
+                    tgt = targets[:, tgt_offset:tgt_offset + L]
                     loss, _, _ = criterion(mag, sign_logit, tgt)
                 elif PREDICT_UNCERTAINTY:
                     mu, log_var = outputs
-                    tgt = targets[:, :mu.shape[1]] if mu.shape[1] < targets.shape[1] else targets
+                    L = mu.shape[1]
+                    tgt = targets[:, tgt_offset:tgt_offset + L]
                     loss = criterion(mu, log_var, tgt)
                 else:
-                    tgt = targets[:, :outputs.shape[1]] if outputs.shape[1] < targets.shape[1] else targets
+                    L = outputs.shape[1]
+                    tgt = targets[:, tgt_offset:tgt_offset + L]
                     loss = criterion(outputs, tgt)
 
             scaler.scale(loss).backward()
@@ -517,30 +460,25 @@ def train_model(run_name, run_dir, model_name, model, train_loader, val_loader, 
 
                 with autocast(device_type='cuda', dtype=torch.float16):
                     outputs = model(seqs, imu=imus)
+                    tgt_offset = getattr(model, 'pair_target_offset', 0)
                     if PREDICT_SIGN_TWO_HEAD:
-                        mag, sign_logit = outputs               # [B, S or S-1]
-                        # Pair encoder: predictions are S-1 long, target last
-                        # pair = motion(S-2 → S-1) = targets[:, S-2].
-                        # Frame encoder: predictions are S long, target last
-                        # position = motion(S-1 → S) = targets[:, S-1].
-                        # Either way, the LAST element of preds aligns with
-                        # targets[:, mag.shape[1] - 1].
-                        last_idx = mag.shape[1] - 1
-                        tgt = targets[:, :mag.shape[1]]
+                        mag, sign_logit = outputs
+                        L = mag.shape[1]
+                        tgt = targets[:, tgt_offset:tgt_offset + L]
                         v_loss, _, _ = criterion(mag, sign_logit, tgt)
                         signed_last = mag[:, -1] * torch.tanh(sign_logit[:, -1])
-                        v_mae = pure_l1(signed_last, targets[:, last_idx])
+                        v_mae = pure_l1(signed_last, targets[:, tgt_offset + L - 1])
                     elif PREDICT_UNCERTAINTY:
                         mu, log_var = outputs
-                        last_idx = mu.shape[1] - 1
-                        tgt = targets[:, :mu.shape[1]]
+                        L = mu.shape[1]
+                        tgt = targets[:, tgt_offset:tgt_offset + L]
                         v_loss = criterion(mu, log_var, tgt)
-                        v_mae = pure_l1(mu[:, -1], targets[:, last_idx])
+                        v_mae = pure_l1(mu[:, -1], targets[:, tgt_offset + L - 1])
                     else:
-                        last_idx = outputs.shape[1] - 1
-                        tgt = targets[:, :outputs.shape[1]]
+                        L = outputs.shape[1]
+                        tgt = targets[:, tgt_offset:tgt_offset + L]
                         v_loss = criterion(outputs, tgt)
-                        v_mae = pure_l1(outputs[:, -1], targets[:, last_idx])
+                        v_mae = pure_l1(outputs[:, -1], targets[:, tgt_offset + L - 1])
                     val_loss += v_loss.item()
                     val_mae_sum += v_mae.item()
 
@@ -584,13 +522,8 @@ def calculate_metrics(z_pred, z_real):
     return mae, final_drift, total_length, fdr
 
 def _smooth_trajectory(traj, window):
-    """Centered moving-average smoother on the per-step Δz sequence, then
-    reaccumulate. Preserves the trajectory's start point. Reduces the impact
-    of single-frame spikes (the failure mode behind the 052/Par_C_PtD outlier
-    in the visual-only ablation) without changing model weights.
-
-    Pure numpy; no scipy dependency.
-    """
+    """Centered moving-average on per-step Δz, then reaccumulate. Preserves
+    the trajectory's start point. Pure numpy."""
     traj = np.asarray(traj, dtype=np.float64)
     if window <= 1 or len(traj) < window + 2:
         return traj
@@ -598,20 +531,14 @@ def _smooth_trajectory(traj, window):
         window += 1
     steps = np.diff(traj)
     kernel = np.ones(window, dtype=np.float64) / window
-    # 'same' pads with zeros at the edges; for trajectories of length 400+
-    # this only biases the first/last ~window/2 steps, which is negligible.
     smoothed = np.convolve(steps, kernel, mode='same')
     return np.concatenate([traj[:1], traj[0] + np.cumsum(smoothed)])
 
 
 def predict_z_trajectory(model, frames, tforms, imu_verifier, start_idx=0, end_idx=None,
                          use_tta=False, smooth_window=0):
-    """Predict signed Z trajectory frame-by-frame.
-
-    use_tta: if True, average model outputs over the input and its horizontally
-    flipped version. Z-axis motion is invariant to lateral flip, so the flip
-    averaging reduces sign-flip variance without biasing the prediction.
-    """
+    """Predict signed Z trajectory frame-by-frame; optional hflip TTA and
+    moving-average smoothing on the output."""
     if end_idx is None: end_idx = len(frames)
     if end_idx - start_idx <= SEQ_LEN: return None, None
 
@@ -619,11 +546,8 @@ def predict_z_trajectory(model, frames, tforms, imu_verifier, start_idx=0, end_i
     use_two_head    = getattr(model, 'predict_sign', False)
     use_pair        = getattr(model, 'pair_encoder', False)
 
-    # Pair encoder's last output predicts motion ARRIVING at the last frame
-    # in the window (motion(S-2 → S-1)). Frame encoder's last output predicts
-    # motion LEAVING (motion(S-1 → S), future). To cover the same trajectory
-    # transitions, the pair-encoder loop starts one trajectory frame earlier
-    # and runs one more iteration.
+    # Pair encoder predicts motion arriving at the last frame; frame encoder
+    # predicts the next motion. Shift indexing accordingly.
     if use_pair:
         init_frame = start_idx + SEQ_LEN - 2   # one earlier
         loop_end   = end_idx - SEQ_LEN + 1
@@ -640,9 +564,7 @@ def predict_z_trajectory(model, frames, tforms, imu_verifier, start_idx=0, end_i
     traj_real = [curr_z_real]
 
     def _forward(inp):
-        """Forward with optional horizontal-flip TTA. Returns a tensor (or tuple)
-        of the same shape as a normal forward — head outputs are pre-averaged
-        across the original and flipped inputs when use_tta is on."""
+        """Model forward, averaging with the hflipped input when use_tta is on."""
         out = model(inp)
         if not use_tta:
             return out
@@ -659,12 +581,7 @@ def predict_z_trajectory(model, frames, tforms, imu_verifier, start_idx=0, end_i
         return (out + out_flipped) / 2
 
     def _model_signed_dz(out):
-        """Resolve a single signed Δz scalar from any of the supported model
-        output shapes. With multi-step supervision the model returns [B, S]
-        tensors; we read only the last position (S-1), which forecasts the
-        next future motion — same semantics as the original single-step
-        convention.
-        """
+        """Resolve one signed Δz scalar from any model output shape (last position)."""
         if use_two_head:
             mag_t, sign_logit_t = out                                  # [B, S]
             signed = mag_t[..., -1] * torch.tanh(sign_logit_t[..., -1])
@@ -678,10 +595,7 @@ def predict_z_trajectory(model, frames, tforms, imu_verifier, start_idx=0, end_i
         init_pos = np.array([0.0, 0.0, curr_z_pred], dtype=np.float64)
         init_rot = tforms[init_frame, :3, :3].astype(np.float64)
 
-        # Bootstrap v_z by averaging the first N model predictions. A single
-        # first-frame estimate was noisy enough to point v_z the wrong way on
-        # some scans (Par_S_PtD, Par_L_DtP regressed in the bootstrap_v1 run);
-        # averaging tames that variance without biasing direction.
+        # Bootstrap v_z from the average of the first N visual predictions.
         n_init = min(5, max(1, end_idx - start_idx - SEQ_LEN))
         init_dzs = []
         for k in range(n_init):
@@ -712,19 +626,13 @@ def predict_z_trajectory(model, frames, tforms, imu_verifier, start_idx=0, end_i
             out = _forward(inp)
             z_visual = _model_signed_dz(out)
             if use_uncertainty:
-                # log_var at last position; the verifier currently uses
-                # fixed σ regardless (use_fixed_sigma=True).
                 sigma_visual = float(torch.exp(0.5 * out[1][..., -1]).item())
             else:
                 sigma_visual = None
 
-            # Frame encoder: real_step_offset = SEQ_LEN → motion(t+S-1 → t+S)
-            # Pair encoder:  real_step_offset = SEQ_LEN-1 → motion(t+S-2 → t+S-1)
             real_step = tforms[t + real_step_offset, 2, 3] - tforms[t + real_step_offset - 1, 2, 3]
 
             if imu_verifier is not None:
-                # IMU sample aligned to the start of the transition the model
-                # is predicting (frame encoder: t+S-1, pair encoder: t+S-2).
                 idx = t + real_step_offset - 1
                 accel = imu_full[idx, :3]
                 gyro  = imu_full[idx, 3:]
@@ -990,21 +898,15 @@ if __name__ == '__main__':
     parser.add_argument('--eval-only', '-e', default=None, metavar='CKPT',
                         help='Skip training; load this .pth checkpoint and run evaluation only.')
     parser.add_argument('--sigma', '-s', type=float, default=None, metavar='SIGMA',
-                        help='Override IMUVerifier default_visual_sigma (mm). Was 0.3 by default; '
-                             'tighter values (0.1-0.2) suit better per-frame predictions.')
+                        help='Override IMUVerifier default_visual_sigma (mm).')
     parser.add_argument('--tta', action='store_true',
-                        help='Enable horizontal-flip test-time augmentation at inference. '
-                             'Doubles the per-frame forward cost but reduces sign-flip variance.')
+                        help='Enable horizontal-flip test-time augmentation at inference.')
     parser.add_argument('--filter', '-f', choices=['eskf', 'complementary', 'none'], default=None,
-                        help='Override fusion filter at inference. eskf = ESKF (current default), '
-                             'complementary = simple α-blend baseline, none = visual-only sum.')
+                        help='Override fusion filter at inference.')
     parser.add_argument('--alpha', '-a', type=float, default=0.2, metavar='ALPHA',
-                        help='Complementary filter blending coefficient (only used with --filter complementary). '
-                             '0 = pure visual, 1 = pure IMU dead-reckoning.')
+                        help='Complementary filter blending coefficient.')
     parser.add_argument('--smooth', type=int, default=0, metavar='WINDOW',
-                        help='Post-process predicted trajectory with a centered moving-average '
-                             'smoother (window must be odd; 0 = off). Targets noisy-frame outliers. '
-                             'Try 5 or 7.')
+                        help='Moving-average smoother window for the predicted trajectory (0 = off).')
     args = parser.parse_args()
 
     print(f"[{get_time()}] --- STEP 1: PREPARING DATASETS ---")
@@ -1052,7 +954,8 @@ if __name__ == '__main__':
         fima_model = FiMANet(seq_len=SEQ_LEN, use_imu=USE_IMU,
                              predict_uncertainty=PREDICT_UNCERTAINTY,
                              predict_sign=PREDICT_SIGN_TWO_HEAD,
-                             pair_encoder=USE_PAIR_ENCODER)
+                             pair_encoder=USE_PAIR_ENCODER,
+                             pair_strides=PAIR_STRIDES)
         fima_history, best_model_path = train_model(
             run_name, run_dir, "FiMA_UnfrozenBackbone", fima_model, train_loader, val_loader, EPOCHS, use_imu=USE_IMU
         )
@@ -1065,17 +968,17 @@ if __name__ == '__main__':
     eval_model = FiMANet(seq_len=SEQ_LEN, use_imu=USE_IMU,
                          predict_uncertainty=PREDICT_UNCERTAINTY,
                          predict_sign=PREDICT_SIGN_TWO_HEAD,
-                         pair_encoder=USE_PAIR_ENCODER).to(DEVICE)
+                         pair_encoder=USE_PAIR_ENCODER,
+                         pair_strides=PAIR_STRIDES).to(DEVICE)
     eval_model = load_weights_safe(eval_model, best_model_path)
 
-    # Filter selection: CLI --filter overrides the USE_IMU_VERIFIER config.
+    # --filter CLI overrides USE_IMU_VERIFIER.
     if args.filter is not None:
         filter_type = args.filter
     else:
         filter_type = 'eskf' if USE_IMU_VERIFIER else 'none'
 
     if filter_type == 'eskf':
-        # σ override: --sigma 0.15 (or any) takes precedence over the verifier default.
         imu_verifier_kwargs = {}
         if args.sigma is not None:
             imu_verifier_kwargs['default_visual_sigma'] = float(args.sigma)
