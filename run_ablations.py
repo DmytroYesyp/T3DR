@@ -40,6 +40,11 @@ EXPERIMENTS = [
     # --- Visual only (no filter) ---
     ("Visual only",              "ablation_visual_only",        ["--filter", "none"]),
     ("Visual only + TTA",        "ablation_visual_only_tta",    ["--filter", "none", "--tta"]),
+    # --- Extended ablation: filter + TTA combinations and smoothing windows ---
+    ("Complementary α=0.3 + TTA",         "ablation_comp_a030_tta",      ["--filter", "complementary", "--alpha", "0.3", "--tta"]),
+    ("ESKF σ=0.05 + TTA",                 "ablation_eskf_sigma005_tta",  ["--filter", "eskf", "--sigma", "0.05", "--tta"]),
+    ("Visual + TTA + smooth=11",          "ablation_visual_tta_sm11",    ["--filter", "none", "--tta", "--smooth", "11"]),
+    ("Complementary α=0.3 + TTA + sm=7",  "ablation_comp_a030_tta_sm7",  ["--filter", "complementary", "--alpha", "0.3", "--tta", "--smooth", "7"]),
 ]
 
 
