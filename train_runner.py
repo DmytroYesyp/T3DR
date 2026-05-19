@@ -16,7 +16,10 @@ from torch.utils.data import Dataset, DataLoader, ConcatDataset
 from torch.amp import autocast, GradScaler
 from datetime import datetime
 
-from models.fimanet import FiMANet
+if os.environ.get("USE_MAMBA", "0") == "1":
+    from models.fimanet_mamba import FiMANetMamba as FiMANet
+else:
+    from models.fimanet import FiMANet
 from models.moglonet import MoGLoNet
 from lib.imu_simulator import IMUSimulator
 from lib.imu_verifier import IMUVerifier
@@ -44,7 +47,7 @@ SIGN_LABEL_MIN_DZ = 0.01     # mm — mask BCE on near-stationary frames
 # Pair encoder: explicit [f_curr | Δ_s1 | Δ_s2 | ...] before the temporal stack.
 USE_PAIR_ENCODER = True
 # Multi-scale strides; output length becomes SEQ_LEN - max(strides).
-PAIR_STRIDES = (1, 2)
+PAIR_STRIDES = (1,)
 
 BASE_DATA_DIR = "/home/123ghdh/datasets"
 TRAIN_FOLDERS = [os.path.join(BASE_DATA_DIR, str(i).zfill(3)) for i in range(50)]
