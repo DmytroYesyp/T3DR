@@ -274,7 +274,7 @@ def train_model(run_name, run_dir, model, train_loader, val_loader, epochs):
         {'params': head_params, 'lr': 1e-4},
     ], weight_decay=1e-5)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=3)
-    criterion = WeightedParamL1Loss(rot_weight=ROT_WEIGHT, start_pos=5)
+    criterion = WeightedParamL1Loss(rot_weight=ROT_WEIGHT, start_pos=5).to(DEVICE)
     scaler = GradScaler('cuda')
 
     best_val = float('inf')
