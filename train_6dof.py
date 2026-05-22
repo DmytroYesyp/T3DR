@@ -1,5 +1,5 @@
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 
 import argparse
 import cv2
@@ -22,7 +22,7 @@ from models.fimanet_mamba_6dof import FiMANetMamba6DOF
 # =============================================================================
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 SEQ_LEN = 20
-BATCH_SIZE = 96  # 6-DoF is heavier; reduce from 164
+BATCH_SIZE = 164
 EPOCHS = 10
 WARMUP_EPOCHS = 4
 PAIR_STRIDES = (1,)
