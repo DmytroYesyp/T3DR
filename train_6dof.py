@@ -9,7 +9,6 @@ import h5py
 import torch
 import torch.nn as nn
 import numpy as np
-from collections import OrderedDict
 from torch.utils.data import Dataset, DataLoader, ConcatDataset
 from torch.amp import autocast, GradScaler
 from datetime import datetime
@@ -27,9 +26,10 @@ EPOCHS = 10
 WARMUP_EPOCHS = 4
 PAIR_STRIDES = (1,)
 
-# Loss weighting: rotations are in radians (~0.01 rad/frame), translations in mm (~1 mm/frame).
-# Multiply rotations by ROT_WEIGHT so they contribute comparably to the L1 loss.
-ROT_WEIGHT = 100.0
+# Loss is point-based (corner-displacement L1 in mm) — no rotation weight needed because
+# the projection automatically balances rotation and translation by their effect on pixels.
+IMG_H, IMG_W = 480, 640
+CORNER_DENSITY = 2  # 2x2 = 4 corners (matches TUS-REC baseline LABEL_TYPE='point')
 
 BASE_DATA_DIR = "/home/123ghdh/datasets"
 TRAIN_FOLDERS = [os.path.join(BASE_DATA_DIR, str(i).zfill(3)) for i in range(50)]
@@ -98,8 +98,86 @@ def collect_val_files_stratified(n_per_subject=24):
     return pairs
 
 # =============================================================================
+# DIFFERENTIABLE GEOMETRY (torch — used in the loss)
+# =============================================================================
+def euler_zyx_to_matrix(euler):
+    """euler: (..., 3) — (rz, ry, rx). Returns (..., 3, 3) rotation matrix.
+    Matches pytorch3d.transforms.euler_angles_to_matrix(euler, 'ZYX'): R = Rz @ Ry @ Rx.
+    Differentiable; runs on whichever device the input tensor lives on."""
+    rz, ry, rx = euler.unbind(-1)
+    cz, sz = torch.cos(rz), torch.sin(rz)
+    cy, sy = torch.cos(ry), torch.sin(ry)
+    cx, sx = torch.cos(rx), torch.sin(rx)
+    zero = torch.zeros_like(rz)
+    one  = torch.ones_like(rz)
+
+    Rz = torch.stack([
+        torch.stack([  cz, -sz, zero], dim=-1),
+        torch.stack([  sz,  cz, zero], dim=-1),
+        torch.stack([zero, zero,  one], dim=-1),
+    ], dim=-2)
+    Ry = torch.stack([
+        torch.stack([  cy, zero,   sy], dim=-1),
+        torch.stack([zero,  one, zero], dim=-1),
+        torch.stack([ -sy, zero,   cy], dim=-1),
+    ], dim=-2)
+    Rx = torch.stack([
+        torch.stack([ one, zero, zero], dim=-1),
+        torch.stack([zero,   cx,  -sx], dim=-1),
+        torch.stack([zero,   sx,   cx], dim=-1),
+    ], dim=-2)
+    return torch.matmul(torch.matmul(Rz, Ry), Rx)
+
+
+def params_to_corner_points(params, image_points_mm):
+    """params: (..., 6) — (rz, ry, rx, tx, ty, tz) in image_mm coords.
+    image_points_mm: (4, P) homogeneous corner points in image_mm.
+    Returns (..., 3, P) transformed corner points (xyz only)."""
+    R = euler_zyx_to_matrix(params[..., :3])    # (..., 3, 3)
+    t = params[..., 3:]                          # (..., 3)
+    batch_shape = t.shape[:-1]
+    T = torch.zeros(*batch_shape, 4, 4, device=params.device, dtype=params.dtype)
+    T[..., :3, :3] = R
+    T[..., :3, 3]  = t
+    T[..., 3, 3]   = 1.0
+    return torch.matmul(T, image_points_mm)[..., :3, :]   # (..., 3, P)
+
+
+def reference_image_points(image_size=(IMG_H, IMG_W), density=CORNER_DENSITY):
+    """Returns (4, density*density) corner points in pixel coords, homogeneous.
+    Matches the TUS-REC baseline's reference_image_points exactly."""
+    pts = torch.flip(torch.cartesian_prod(
+        torch.linspace(1, image_size[0], density),
+        torch.linspace(1, image_size[1], density),
+    ).t(), [0])
+    pts = torch.cat([
+        pts,
+        torch.zeros(1, pts.shape[1]),
+        torch.ones(1, pts.shape[1]),
+    ], dim=0)
+    return pts  # (4, density*density)
+
+
+# =============================================================================
 # TARGET COMPUTATION
 # =============================================================================
+def tforms_to_target_points(tforms, image_mm_to_tool, image_points_mm):
+    """tforms: (N+1, 4, 4) tool-to-world.
+    image_points_mm: (4, P) homogeneous corner points in image_mm (numpy).
+    Returns: (N, 3, P) GT corner points after applying the local image_mm transform
+    (frame_{i+1} -> frame_i) for each consecutive frame pair."""
+    tool_to_image_mm = np.linalg.inv(image_mm_to_tool)
+    tforms_inv = np.linalg.inv(tforms)
+    N = len(tforms) - 1
+    P = image_points_mm.shape[1]
+    target = np.zeros((N, 3, P), dtype=np.float32)
+    for i in range(N):
+        t_tool = tforms_inv[i] @ tforms[i + 1]
+        t_imm  = tool_to_image_mm @ t_tool @ image_mm_to_tool
+        target[i] = (t_imm @ image_points_mm)[:3, :]
+    return target
+
+
 def tforms_to_6dof_params(tforms, image_mm_to_tool):
     """Convert a sequence of tool-to-world transformations into per-pair 6-DoF parameters
     in image_mm coordinates, matching the TUS-REC2024 baseline's 'parameter' label.
@@ -127,31 +205,37 @@ def tforms_to_6dof_params(tforms, image_mm_to_tool):
 # =============================================================================
 # LOSS
 # =============================================================================
-class WeightedParamL1Loss(nn.Module):
-    """L1 on (rx, ry, rz, tx, ty, tz) with rotation weight to balance scales."""
-    def __init__(self, rot_weight=100.0, start_pos=5):
+class PointBasedLoss(nn.Module):
+    """L1 between predicted and GT corner-point positions in mm, after applying the
+    predicted vs GT image_mm transform. Auto-balances rotation and translation by
+    their effect on pixel coordinates — same idea as the TUS-REC baseline's
+    LABEL_TYPE='point' (see baseline/utils/transform.py)."""
+    def __init__(self, image_points_mm, start_pos=5):
         super().__init__()
-        self.rot_weight = rot_weight
+        # image_points_mm: (4, P) homogeneous; pre-compute once.
+        self.register_buffer('image_points_mm', image_points_mm)
         self.start_pos = start_pos
-        weight = torch.tensor([rot_weight, rot_weight, rot_weight, 1.0, 1.0, 1.0], dtype=torch.float32)
-        self.register_buffer('weight', weight)
 
-    def forward(self, pred, target):
-        # pred, target: [B, L, 6]
-        L = pred.shape[1]
-        start = min(self.start_pos, L - 1)
-        diff = (pred[:, start:, :] - target[:, start:, :]).abs() * self.weight
+    def forward(self, pred_params, target_points):
+        # pred_params:   [B, L, 6]
+        # target_points: [B, L+, 3, P]  (sliced to L below)
+        L = pred_params.shape[1]
+        target = target_points[:, :L, :, :]
+        pred   = params_to_corner_points(pred_params, self.image_points_mm)  # [B, L, 3, P]
+        start  = min(self.start_pos, L - 1)
+        diff   = (pred[:, start:, :, :] - target[:, start:, :, :]).abs()
         return diff.mean()
 
 # =============================================================================
 # DATASETS
 # =============================================================================
 class LargeUSDataset6DOF(Dataset):
-    def __init__(self, root_dirs, seq_len, image_mm_to_tool, augment=True):
+    def __init__(self, root_dirs, seq_len, image_mm_to_tool, image_points_mm, augment=True):
         self.samples = []
         self.seq_len = seq_len
         self.augment = augment
         self.image_mm_to_tool = image_mm_to_tool
+        self.image_points_mm = image_points_mm
         print(f"[{get_time()}] Indexing folders...")
         for folder in root_dirs:
             if not os.path.exists(folder):
@@ -203,24 +287,24 @@ class LargeUSDataset6DOF(Dataset):
             seq.append(np.expand_dims(img, axis=0).astype(np.float32))
         if self.augment:
             seq = self._augment(seq)
-        # NOTE hflip changes the image x-axis -> in-plane translation/rotation flips sign.
-        # For SEQ_LEN=20, target shape is [20, 6]; we DON'T flip the param sign here because
-        # the model learns the augmented mapping directly. This is consistent with how the
-        # original Z-only training handled hflip (Z is invariant to hflip; for 6-DoF, the
-        # rotations and X-translation will average to zero across hflip pairs at convergence).
+        # NOTE: hflip changes the image x-axis. For point-based loss, target_points are
+        # computed BEFORE the visual hflip, so the model learns the augmented input -> non-flipped
+        # output mapping. Same convention as the Z-only training (Z is invariant to hflip).
         seq_tensor = torch.tensor(np.stack(seq), dtype=torch.float32)
-        params = tforms_to_6dof_params(tforms.astype(np.float32), self.image_mm_to_tool)
-        return seq_tensor, torch.tensor(params, dtype=torch.float32)
+        target = tforms_to_target_points(tforms.astype(np.float32),
+                                          self.image_mm_to_tool, self.image_points_mm)
+        return seq_tensor, torch.tensor(target, dtype=torch.float32)
 
 
 class MemoryUSDataset6DOF(Dataset):
-    def __init__(self, frames_path, tforms_path, seq_len, image_mm_to_tool):
+    def __init__(self, frames_path, tforms_path, seq_len, image_mm_to_tool, image_points_mm):
         with h5py.File(frames_path, 'r') as f:
             self.f = f['frames'][:]
         with h5py.File(tforms_path, 'r') as t:
             self.t = t['tforms'][:]
         self.seq_len = seq_len
         self.image_mm_to_tool = image_mm_to_tool
+        self.image_points_mm = image_points_mm
         self.samples = list(range(0, len(self.f) - seq_len))
 
     def __len__(self):
@@ -237,13 +321,13 @@ class MemoryUSDataset6DOF(Dataset):
             seq.append(np.expand_dims(img, axis=0))
         seq_tensor = torch.tensor(np.stack(seq), dtype=torch.float32)
         tforms = self.t[start:start + self.seq_len + 1].astype(np.float32)
-        params = tforms_to_6dof_params(tforms, self.image_mm_to_tool)
-        return seq_tensor, torch.tensor(params, dtype=torch.float32)
+        target = tforms_to_target_points(tforms, self.image_mm_to_tool, self.image_points_mm)
+        return seq_tensor, torch.tensor(target, dtype=torch.float32)
 
 # =============================================================================
 # TRAINING
 # =============================================================================
-def train_model(run_name, run_dir, model, train_loader, val_loader, epochs):
+def train_model(run_name, run_dir, model, train_loader, val_loader, epochs, image_points_mm_torch):
     print(f"\n{'='*50}")
     print(f"[{get_time()}] INITIALIZING 6-DoF TRAINING")
     print(f"[{get_time()}] Run name: {run_name}")
@@ -274,7 +358,7 @@ def train_model(run_name, run_dir, model, train_loader, val_loader, epochs):
         {'params': head_params, 'lr': 1e-4},
     ], weight_decay=1e-5)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=3)
-    criterion = WeightedParamL1Loss(rot_weight=ROT_WEIGHT, start_pos=5).to(DEVICE)
+    criterion = PointBasedLoss(image_points_mm_torch, start_pos=5).to(DEVICE)
     scaler = GradScaler('cuda')
 
     best_val = float('inf')
@@ -288,48 +372,48 @@ def train_model(run_name, run_dir, model, train_loader, val_loader, epochs):
 
         model.train()
         train_loss = 0.0
-        for i, (seqs, targets) in enumerate(train_loader):
-            seqs = seqs.to(DEVICE, non_blocking=True)
-            targets = targets.to(DEVICE, non_blocking=True)
+        for i, (seqs, target_pts) in enumerate(train_loader):
+            seqs       = seqs.to(DEVICE, non_blocking=True)
+            target_pts = target_pts.to(DEVICE, non_blocking=True)
             optimizer.zero_grad()
             with autocast(device_type='cuda', dtype=torch.float16):
-                outputs = model(seqs)  # [B, L, 6]
-                L = outputs.shape[1]
-                tgt = targets[:, :L, :]
-                loss = criterion(outputs, tgt)
+                outputs = model(seqs)             # [B, L, 6]
+                loss    = criterion(outputs, target_pts)  # mean corner-displacement |·| in mm
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
             scaler.step(optimizer)
             scaler.update()
             train_loss += loss.item()
             if i % 100 == 0:
-                print(f"[{get_time()}] Ep {epoch+1} | Batch {i}/{total_batches} | Loss: {loss.item():.4f}")
+                print(f"[{get_time()}] Ep {epoch+1} | Batch {i}/{total_batches} | Loss: {loss.item():.4f} mm")
 
         avg_train = train_loss / total_batches
 
-        # Validation: per-pair param L1 + raw translation MAE (mm)
+        # Validation: same point-based loss + max-corner-error sanity metric
         model.eval()
         val_loss = 0.0
-        val_trans_mae = 0.0
+        val_max_err = 0.0
         with torch.no_grad():
-            for seqs, targets in val_loader:
-                seqs = seqs.to(DEVICE, non_blocking=True)
-                targets = targets.to(DEVICE, non_blocking=True)
+            for seqs, target_pts in val_loader:
+                seqs       = seqs.to(DEVICE, non_blocking=True)
+                target_pts = target_pts.to(DEVICE, non_blocking=True)
                 with autocast(device_type='cuda', dtype=torch.float16):
                     outputs = model(seqs)
-                    L = outputs.shape[1]
-                    tgt = targets[:, :L, :]
-                    v_loss = criterion(outputs, tgt)
-                    # last position only — apples-to-apples with old Z-only metric
-                    trans_mae = (outputs[:, -1, 3:6] - tgt[:, -1, 3:6]).abs().mean()
-                val_loss += v_loss.item()
-                val_trans_mae += trans_mae.item()
+                    v_loss  = criterion(outputs, target_pts)
+                    # Sanity metric: last-position max corner displacement error in mm
+                    pred_pts = params_to_corner_points(outputs[:, -1, :], criterion.image_points_mm)  # [B, 3, P]
+                    last_pos = outputs.shape[1] - 1
+                    gt_pts = target_pts[:, last_pos, :, :]
+                    per_corner = torch.linalg.norm(pred_pts - gt_pts, dim=1)  # [B, P]
+                    max_err = per_corner.max(dim=1).values.mean()             # avg across batch of per-scan max
+                val_loss   += v_loss.item()
+                val_max_err += max_err.item()
 
-        avg_val = val_loss / len(val_loader)
-        avg_mae = val_trans_mae / len(val_loader)
+        avg_val     = val_loss / len(val_loader)
+        avg_max_err = val_max_err / len(val_loader)
         scheduler.step(avg_val)
-        print(f"[{get_time()}] Epoch {epoch+1}: Train={avg_train:.4f} | Val={avg_val:.4f} | Trans MAE={avg_mae:.4f} mm")
+        print(f"[{get_time()}] Epoch {epoch+1}: Train={avg_train:.4f} mm | Val={avg_val:.4f} mm | Max corner err={avg_max_err:.4f} mm")
 
         if avg_val < best_val:
             best_val = avg_val
@@ -352,6 +436,12 @@ if __name__ == '__main__':
     pixel_to_image_mm, image_mm_to_tool = read_calib_matrices(CALIB_PATH)
     print(f"[{get_time()}] Loaded calib from {CALIB_PATH}")
 
+    # Reference corner points (4 corners of 480x640 image) in image_mm.
+    image_points_pixel = reference_image_points((IMG_H, IMG_W), CORNER_DENSITY).numpy()  # (4, P) numpy
+    image_points_mm    = pixel_to_image_mm @ image_points_pixel                          # (4, P) numpy
+    image_points_mm_torch = torch.tensor(image_points_mm, dtype=torch.float32)
+    print(f"[{get_time()}] Corner reference: {image_points_mm.shape[1]} points in image_mm")
+
     run_name = next_run_name(args.name)
     run_dir = make_run_dirs(run_name)
     print(f"[{get_time()}] Run tag: {run_name}")
@@ -359,21 +449,25 @@ if __name__ == '__main__':
 
     print(f"[{get_time()}] --- STEP 1: DATASETS ---")
     train_ds = LargeUSDataset6DOF(TRAIN_FOLDERS, seq_len=SEQ_LEN,
-                                   image_mm_to_tool=image_mm_to_tool, augment=True)
+                                   image_mm_to_tool=image_mm_to_tool,
+                                   image_points_mm=image_points_mm, augment=True)
     train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True,
                               num_workers=4, pin_memory=True)
 
     val_pairs = collect_val_files_stratified(VAL_PER_SUBJECT)
     n_subj = len({c.split('/')[0] for _, _, c in val_pairs})
     print(f"[{get_time()}] Validation set: {len(val_pairs)} cases across {n_subj} subject(s)")
-    val_datasets = [MemoryUSDataset6DOF(fp, tp, seq_len=SEQ_LEN, image_mm_to_tool=image_mm_to_tool)
+    val_datasets = [MemoryUSDataset6DOF(fp, tp, seq_len=SEQ_LEN,
+                                         image_mm_to_tool=image_mm_to_tool,
+                                         image_points_mm=image_points_mm)
                     for fp, tp, _ in val_pairs]
     val_ds = ConcatDataset(val_datasets)
     val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=2, pin_memory=True)
 
     print(f"[{get_time()}] --- STEP 2: BUILD + TRAIN MODEL ---")
     model = FiMANetMamba6DOF(seq_len=SEQ_LEN, pair_encoder=True, pair_strides=PAIR_STRIDES)
-    best_path = train_model(run_name, run_dir, model, train_loader, val_loader, EPOCHS)
+    best_path = train_model(run_name, run_dir, model, train_loader, val_loader, EPOCHS,
+                            image_points_mm_torch)
 
     del train_loader, train_ds, val_loader, val_ds, val_datasets, model
     gc.collect()
