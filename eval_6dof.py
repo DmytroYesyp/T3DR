@@ -34,7 +34,7 @@ INFER_H, INFER_W = 256, 256
 BASE_DATA_DIR = "/home/123ghdh/datasets"
 VAL_FRAMES_ROOT = os.path.join(BASE_DATA_DIR, 'valDataset/data/frames')
 VAL_TFORMS_ROOT = os.path.join(BASE_DATA_DIR, 'valDataset/data/transfs')
-LANDMARK_ROOT   = os.path.join(BASE_DATA_DIR, 'landmark')
+LANDMARK_ROOT   = os.path.join(BASE_DATA_DIR, 'valDataset/data/landmark')
 CALIB_PATH      = os.path.join(BASE_DATA_DIR, 'calib_matrix.csv')
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
