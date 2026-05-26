@@ -21,10 +21,11 @@ from models.fimanet_mamba_6dof import FiMANetMamba6DOF
 # =============================================================================
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 SEQ_LEN = 20
-BATCH_SIZE = 164
-EPOCHS = 10
+BATCH_SIZE = 112
+EPOCHS = 15
 WARMUP_EPOCHS = 4
 PAIR_STRIDES = (1,)
+BACKBONE = os.environ.get("BACKBONE", "resnet34")  # 'resnet18' | 'resnet34' | 'resnet50'
 
 # Loss is point-based (corner-displacement L1 in mm) — no rotation weight needed because
 # the projection automatically balances rotation and translation by their effect on pixels.
@@ -261,16 +262,20 @@ class LargeUSDataset6DOF(Dataset):
         return len(self.samples)
 
     @staticmethod
-    def _augment(seq):
-        # hflip / brightness-contrast / speckle
-        if np.random.rand() < 0.5:
-            seq = [np.ascontiguousarray(np.flip(im, axis=2)) for im in seq]
-        if np.random.rand() < 0.5:
-            g = np.random.uniform(0.9, 1.1)
-            b = np.random.uniform(-0.05, 0.05)
+    def _augment_intensity(seq):
+        """Intensity-only augmentation. NO hflip (it would invalidate 6-DoF targets)."""
+        if np.random.rand() < 0.6:
+            g = np.random.uniform(0.85, 1.15)
+            b = np.random.uniform(-0.08, 0.08)
             seq = [np.clip(im * g + b, 0., 1.).astype(np.float32) for im in seq]
-        if np.random.rand() < 0.3:
-            seq = [np.clip(im * (1 + np.random.randn(*im.shape).astype(np.float32) * 0.05), 0., 1.) for im in seq]
+        if np.random.rand() < 0.4:
+            # Gamma — emphasises mid-tones or shadows
+            gamma = np.random.uniform(0.6, 1.6)
+            seq = [np.clip(im ** gamma, 0., 1.).astype(np.float32) for im in seq]
+        if np.random.rand() < 0.4:
+            # Stronger per-frame speckle than before (0.05 -> 0.08)
+            seq = [np.clip(im * (1 + np.random.randn(*im.shape).astype(np.float32) * 0.08), 0., 1.)
+                   for im in seq]
         return seq
 
     def __getitem__(self, idx):
@@ -278,6 +283,14 @@ class LargeUSDataset6DOF(Dataset):
         with h5py.File(m['path'], 'r') as f:
             frames = f['frames'][m['start']:m['start'] + self.seq_len]
             tforms = f['tforms'][m['start']:m['start'] + self.seq_len + 1]
+
+        # Z-REVERSE augmentation: with 50% probability reverse both frames and tforms
+        # together — equivalent to playing the probe motion backwards. Doubles the
+        # effective training data and balances DtP/PtD directional exposure.
+        if self.augment and np.random.rand() < 0.5:
+            frames = frames[::-1].copy()
+            tforms = tforms[::-1].copy()
+
         seq = []
         for i in range(self.seq_len):
             img = frames[i]
@@ -286,10 +299,8 @@ class LargeUSDataset6DOF(Dataset):
                 img = img / 255.0
             seq.append(np.expand_dims(img, axis=0).astype(np.float32))
         if self.augment:
-            seq = self._augment(seq)
-        # NOTE: hflip changes the image x-axis. For point-based loss, target_points are
-        # computed BEFORE the visual hflip, so the model learns the augmented input -> non-flipped
-        # output mapping. Same convention as the Z-only training (Z is invariant to hflip).
+            seq = self._augment_intensity(seq)
+
         seq_tensor = torch.tensor(np.stack(seq), dtype=torch.float32)
         target = tforms_to_target_points(tforms.astype(np.float32),
                                           self.image_mm_to_tool, self.image_points_mm)
@@ -465,7 +476,11 @@ if __name__ == '__main__':
     val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=2, pin_memory=True)
 
     print(f"[{get_time()}] --- STEP 2: BUILD + TRAIN MODEL ---")
-    model = FiMANetMamba6DOF(seq_len=SEQ_LEN, pair_encoder=True, pair_strides=PAIR_STRIDES)
+    print(f"[{get_time()}] Backbone: {BACKBONE}")
+    model = FiMANetMamba6DOF(seq_len=SEQ_LEN, pair_encoder=True, pair_strides=PAIR_STRIDES,
+                              backbone=BACKBONE)
+    n_params = sum(p.numel() for p in model.parameters())
+    print(f"[{get_time()}] Total params: {n_params/1e6:.1f}M")
     best_path = train_model(run_name, run_dir, model, train_loader, val_loader, EPOCHS,
                             image_points_mm_torch)
 

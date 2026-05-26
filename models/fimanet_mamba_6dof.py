@@ -30,7 +30,8 @@ class FiMANetMamba6DOF(nn.Module):
 
     def __init__(self, seq_len=20, hidden_size=256, num_layers=2,
                  pair_encoder=True, pair_strides=(1,),
-                 mamba_d_state=16, mamba_d_conv=4, mamba_expand=2):
+                 mamba_d_state=16, mamba_d_conv=4, mamba_expand=2,
+                 backbone='resnet18'):
         super().__init__()
         self.seq_len = seq_len
         self.pair_encoder = pair_encoder
@@ -42,8 +43,23 @@ class FiMANetMamba6DOF(nn.Module):
                 raise ValueError("pair_strides must be positive")
         self._pair_max_stride = max(self.pair_strides) if self.pair_strides else 0
         self.pair_target_offset = max(0, self._pair_max_stride - 1)
+        self.backbone_name = backbone
 
-        base = models.resnet18(weights='IMAGENET1K_V1')
+        # Backbone — channels differ across ResNet variants.
+        # R18/R34: BasicBlock, channels 64/128/256/512
+        # R50:     Bottleneck, channels 256/512/1024/2048
+        if backbone == 'resnet18':
+            base = models.resnet18(weights='IMAGENET1K_V1')
+            ch2, ch3, ch4 = 128, 256, 512
+        elif backbone == 'resnet34':
+            base = models.resnet34(weights='IMAGENET1K_V1')
+            ch2, ch3, ch4 = 128, 256, 512
+        elif backbone == 'resnet50':
+            base = models.resnet50(weights='IMAGENET1K_V2')
+            ch2, ch3, ch4 = 512, 1024, 2048
+        else:
+            raise ValueError(f"Unsupported backbone: {backbone!r}")
+
         base.conv1 = nn.Conv2d(1, 64, kernel_size=7, stride=2, padding=3, bias=False)
 
         self.stem   = nn.Sequential(base.conv1, base.bn1, base.relu, base.maxpool)
@@ -57,8 +73,10 @@ class FiMANetMamba6DOF(nn.Module):
 
         self.pool = nn.AdaptiveAvgPool2d((2, 2))
 
+        # Fusion: (ch2 + ch3 + ch4) × 4 patches → hidden_size
+        fusion_in = (ch2 + ch3 + ch4) * 4
         self.fusion = nn.Sequential(
-            nn.Linear(3584, hidden_size),
+            nn.Linear(fusion_in, hidden_size),
             nn.LayerNorm(hidden_size),
             nn.ReLU(),
             nn.Dropout(0.3),

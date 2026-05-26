@@ -333,6 +333,8 @@ def main():
     parser.add_argument('--limit', type=int, default=None, help='Limit number of scans (debug).')
     parser.add_argument('--mode', choices=['pure', 'hybrid', 'both'], default='both',
                         help="pure: model gives all 6 DoF; hybrid: LK gives (tx, ty), model gives rest; both: comparison")
+    parser.add_argument('--backbone', choices=['resnet18', 'resnet34', 'resnet50'], default='resnet18',
+                        help="Must match the backbone used during training of the checkpoint.")
     args = parser.parse_args()
     do_pure = args.mode in ('pure', 'both')
     do_hybrid = args.mode in ('hybrid', 'both')
@@ -345,8 +347,9 @@ def main():
     pixel_to_image_mm, image_mm_to_tool, _ = read_calib_matrices(CALIB_PATH)
     image_points = reference_image_points((IMG_H, IMG_W)).numpy()  # (4, P)
 
-    print(f"[{get_time()}] Loading model from {args.ckpt}...")
-    model = FiMANetMamba6DOF(seq_len=SEQ_LEN, pair_encoder=True, pair_strides=PAIR_STRIDES).to(DEVICE)
+    print(f"[{get_time()}] Loading model from {args.ckpt}... (backbone={args.backbone})")
+    model = FiMANetMamba6DOF(seq_len=SEQ_LEN, pair_encoder=True, pair_strides=PAIR_STRIDES,
+                              backbone=args.backbone).to(DEVICE)
     ckpt = torch.load(args.ckpt, map_location=DEVICE)
     state_dict = ckpt['model_state_dict'] if isinstance(ckpt, dict) and 'model_state_dict' in ckpt else ckpt
     model.load_state_dict(state_dict)
