@@ -19,9 +19,9 @@ from models.fimanet_mamba_6dof import FiMANetMamba6DOF
 # =============================================================================
 # CONFIG
 # =============================================================================
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 SEQ_LEN = 20
-BATCH_SIZE = 112
+BATCH_SIZE = 96
 EPOCHS = 15
 WARMUP_EPOCHS = 4
 PAIR_STRIDES = (1,)

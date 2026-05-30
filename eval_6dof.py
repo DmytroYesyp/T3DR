@@ -185,21 +185,34 @@ def predict_local_params(model, frames):
             img = img / 255.0
         resized[i, 0] = img.astype(np.float32)
 
+    # Positions [0..LOSS_START_POS-1] were masked from the training loss (see
+    # PointBasedLoss in train_6dof.py: start_pos=5). The model has no supervision at
+    # those positions, so we fall back to its prediction at LOSS_START_POS for them.
+    LOSS_START_POS = 5
+
     with torch.no_grad():
         for start in range(0, N - SEQ_LEN + 1):
             window = torch.from_numpy(resized[start:start + SEQ_LEN]).unsqueeze(0).to(DEVICE)
             out = model(window)  # [1, L, 6]
-            out_np = out[0, -1].float().cpu().numpy()  # 6
-            t_idx = start + last_pos_offset  # transition index (frame t_idx -> t_idx+1)
-            if 0 <= t_idx < N - 1:
-                params[t_idx] = out_np
+            out_np_all = out[0].float().cpu().numpy()  # [L, 6]
 
-    # Fill the unreachable early transitions [0 .. SEQ_LEN-3] with the first valid prediction
-    # (so the trajectory has a sensible start instead of pure-identity drift).
-    if N - 1 > last_pos_offset:
-        first_valid = params[last_pos_offset].copy()
-        for i in range(last_pos_offset):
-            params[i] = first_valid
+            if start == 0:
+                # First window: use the model's own predictions at every output position
+                # to populate the early transitions that no later window can reach with
+                # its last-position output. Positions before LOSS_START_POS use a
+                # supervised fallback (output at LOSS_START_POS), because they were never
+                # trained directly.
+                L = out_np_all.shape[0]
+                fallback = out_np_all[min(LOSS_START_POS, L - 1)]
+                for p in range(L - 1):              # positions 0 .. L-2
+                    t_idx = start + p
+                    if 0 <= t_idx < N - 1:
+                        params[t_idx] = out_np_all[p] if p >= LOSS_START_POS else fallback
+
+            # Always: each window's last output position has the most temporal context
+            t_idx = start + last_pos_offset
+            if 0 <= t_idx < N - 1:
+                params[t_idx] = out_np_all[-1]
 
     return params
 
