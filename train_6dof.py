@@ -21,11 +21,11 @@ from models.fimanet_mamba_6dof import FiMANetMamba6DOF
 # =============================================================================
 DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 SEQ_LEN = 20
-BATCH_SIZE = 96
-EPOCHS = 15
+BATCH_SIZE = 148
+EPOCHS = 20         # was 15 — give the converged R18 + point-loss recipe more headroom
 WARMUP_EPOCHS = 4
 PAIR_STRIDES = (1,)
-BACKBONE = os.environ.get("BACKBONE", "resnet34")  # 'resnet18' | 'resnet34' | 'resnet50'
+BACKBONE = os.environ.get("BACKBONE", "resnet18")  # 'resnet18' | 'resnet34' | 'resnet50' (R34 attempt regressed)
 
 # Loss is point-based (corner-displacement L1 in mm) — no rotation weight needed because
 # the projection automatically balances rotation and translation by their effect on pixels.
@@ -263,18 +263,15 @@ class LargeUSDataset6DOF(Dataset):
 
     @staticmethod
     def _augment_intensity(seq):
-        """Intensity-only augmentation. NO hflip (it would invalidate 6-DoF targets)."""
-        if np.random.rand() < 0.6:
-            g = np.random.uniform(0.85, 1.15)
-            b = np.random.uniform(-0.08, 0.08)
+        """Intensity-only augmentation. NO hflip (it would invalidate 6-DoF targets).
+        Conservative — gamma + stronger speckle were dropped after the R34 attempt
+        plateaued (see thesis Section X: failed-experiment write-up)."""
+        if np.random.rand() < 0.5:
+            g = np.random.uniform(0.9, 1.1)
+            b = np.random.uniform(-0.05, 0.05)
             seq = [np.clip(im * g + b, 0., 1.).astype(np.float32) for im in seq]
-        if np.random.rand() < 0.4:
-            # Gamma — emphasises mid-tones or shadows
-            gamma = np.random.uniform(0.6, 1.6)
-            seq = [np.clip(im ** gamma, 0., 1.).astype(np.float32) for im in seq]
-        if np.random.rand() < 0.4:
-            # Stronger per-frame speckle than before (0.05 -> 0.08)
-            seq = [np.clip(im * (1 + np.random.randn(*im.shape).astype(np.float32) * 0.08), 0., 1.)
+        if np.random.rand() < 0.3:
+            seq = [np.clip(im * (1 + np.random.randn(*im.shape).astype(np.float32) * 0.05), 0., 1.)
                    for im in seq]
         return seq
 
@@ -284,12 +281,11 @@ class LargeUSDataset6DOF(Dataset):
             frames = f['frames'][m['start']:m['start'] + self.seq_len]
             tforms = f['tforms'][m['start']:m['start'] + self.seq_len + 1]
 
-        # Z-REVERSE augmentation: with 50% probability reverse both frames and tforms
-        # together — equivalent to playing the probe motion backwards. Doubles the
-        # effective training data and balances DtP/PtD directional exposure.
-        if self.augment and np.random.rand() < 0.5:
-            frames = frames[::-1].copy()
-            tforms = tforms[::-1].copy()
+        # Z-REVERSE augmentation removed — at p=0.5 it drove the model into a
+        # predict-near-zero attractor (val loss plateaued, GPE regressed from
+        # 44 to 82 mm in the R34 retrain). Documented as a negative result;
+        # see thesis Section X for the write-up. A smaller probability (e.g.
+        # p=0.1) might be safe but is future work.
 
         seq = []
         for i in range(self.seq_len):
