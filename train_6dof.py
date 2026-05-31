@@ -22,7 +22,7 @@ from models.fimanet_mamba_6dof import FiMANetMamba6DOF
 DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 SEQ_LEN = 20
 BATCH_SIZE = 148
-EPOCHS = 20         # was 15 — give the converged R18 + point-loss recipe more headroom
+EPOCHS = 12
 WARMUP_EPOCHS = 4
 PAIR_STRIDES = (1,)
 BACKBONE = os.environ.get("BACKBONE", "resnet18")  # 'resnet18' | 'resnet34' | 'resnet50' (R34 attempt regressed)
@@ -30,7 +30,7 @@ BACKBONE = os.environ.get("BACKBONE", "resnet18")  # 'resnet18' | 'resnet34' | '
 # Loss is point-based (corner-displacement L1 in mm) — no rotation weight needed because
 # the projection automatically balances rotation and translation by their effect on pixels.
 IMG_H, IMG_W = 480, 640
-CORNER_DENSITY = 2  # 2x2 = 4 corners (matches TUS-REC baseline LABEL_TYPE='point')
+CORNER_DENSITY = 4  # 4x4 = 16 points (matches TUS-REC baseline)
 
 BASE_DATA_DIR = "/home/123ghdh/datasets"
 TRAIN_FOLDERS = [os.path.join(BASE_DATA_DIR, str(i).zfill(3)) for i in range(50)]
@@ -250,7 +250,7 @@ class LargeUSDataset6DOF(Dataset):
                         if 'frames' not in f or 'tforms' not in f:
                             continue
                         n = f['frames'].shape[0]
-                        for i in range(0, n - seq_len, 2):
+                        for i in range(0, n - seq_len):
                             self.samples.append({'path': fp, 'start': i})
                 except Exception as e:
                     print(f"err {fp}: {e}")
@@ -361,7 +361,7 @@ def train_model(run_name, run_dir, model, train_loader, val_loader, epochs, imag
         head_params += list(model.pair_proj.parameters())
 
     optimizer = torch.optim.Adam([
-        {'params': backbone_params, 'lr': 5e-6},
+        {'params': backbone_params, 'lr': 1e-5},
         {'params': head_params, 'lr': 1e-4},
     ], weight_decay=1e-5)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=3)
