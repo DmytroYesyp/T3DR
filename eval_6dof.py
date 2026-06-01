@@ -29,7 +29,7 @@ from models.fimanet_mamba_6dof import FiMANetMamba6DOF
 SEQ_LEN = 20
 PAIR_STRIDES = (1,)
 IMG_H, IMG_W = 480, 640
-INFER_H, INFER_W = 256, 256
+INFER_H, INFER_W = 480, 640  # native resolution — MUST match the training NET_H/NET_W
 
 BASE_DATA_DIR = "/home/123ghdh/datasets"
 VAL_FRAMES_ROOT = os.path.join(BASE_DATA_DIR, 'valDataset/data/frames')

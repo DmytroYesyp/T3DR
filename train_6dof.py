@@ -21,7 +21,7 @@ from models.fimanet_mamba_6dof import FiMANetMamba6DOF
 # =============================================================================
 DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 SEQ_LEN = 20
-BATCH_SIZE = 148
+BATCH_SIZE = 48     # was 148 @ 256x256
 EPOCHS = 12
 WARMUP_EPOCHS = 4
 PAIR_STRIDES = (1,)
@@ -31,6 +31,13 @@ BACKBONE = os.environ.get("BACKBONE", "resnet18")  # 'resnet18' | 'resnet34' | '
 # the projection automatically balances rotation and translation by their effect on pixels.
 IMG_H, IMG_W = 480, 640
 CORNER_DENSITY = 4  # 4x4 = 16 points (matches TUS-REC baseline)
+
+# Network input resolution. Train/infer at NATIVE 480x640 to preserve speckle, which is
+# the *only* cue for out-of-plane (tz) motion — the dominant axis in these sweeps.
+# Downsampling to 256x256 (the old setting) blurred out that signal; both DualTrack
+# (full-res local encoder) and FiMA (248x260) keep near-native resolution. Aspect ratio
+# is preserved (no longer squashed to a square).
+NET_H, NET_W = IMG_H, IMG_W  # 480 x 640
 
 BASE_DATA_DIR = "/home/123ghdh/datasets"
 TRAIN_FOLDERS = [os.path.join(BASE_DATA_DIR, str(i).zfill(3)) for i in range(50)]
@@ -290,7 +297,7 @@ class LargeUSDataset6DOF(Dataset):
         seq = []
         for i in range(self.seq_len):
             img = frames[i]
-            img = cv2.resize(img, (256, 256))
+            img = cv2.resize(img, (NET_W, NET_H))  # native 480x640, preserves speckle + aspect ratio
             if img.max() > 1.0:
                 img = img / 255.0
             seq.append(np.expand_dims(img, axis=0).astype(np.float32))
@@ -322,7 +329,7 @@ class MemoryUSDataset6DOF(Dataset):
         seq = []
         for i in range(self.seq_len):
             img = self.f[start + i]
-            img = cv2.resize(img, (256, 256))
+            img = cv2.resize(img, (NET_W, NET_H))  # native 480x640
             if img.max() > 1.0:
                 img = img / 255.0
             seq.append(np.expand_dims(img, axis=0))
