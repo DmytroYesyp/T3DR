@@ -28,8 +28,8 @@ from models.fimanet_mamba_6dof import FiMANetMamba6DOF
 
 SEQ_LEN = 20
 PAIR_STRIDES = (1,)
-IMG_H, IMG_W = 480, 640
-INFER_H, INFER_W = 480, 640  # native resolution — MUST match the training NET_H/NET_W
+IMG_H, IMG_W = 480, 640      # GT corners / calibration grid (NOT resized)
+INFER_H, INFER_W = 240, 320  # network input — MUST match training NET_H/NET_W (half-res)
 
 BASE_DATA_DIR = "/home/123ghdh/datasets"
 VAL_FRAMES_ROOT = os.path.join(BASE_DATA_DIR, 'valDataset/data/frames')
@@ -78,6 +78,18 @@ def reference_image_points(image_size=(IMG_H, IMG_W)):
 # ---------------------------------------------------------------------------
 # 6-DoF param ↔ 4x4 matrix conversion (scipy, ZYX Euler — matches baseline)
 # ---------------------------------------------------------------------------
+def infer_pool_size(state_dict, backbone):
+    """Recover the pool grid from fusion.0.weight so old (2x2) and new ckpts both load."""
+    chsum = 3584 if backbone == 'resnet50' else 896  # R18/R34: 128+256+512
+    w = state_dict.get('fusion.0.weight')
+    if w is None:
+        return 2
+    fusion_in = w.shape[1]
+    area = fusion_in // chsum
+    size = int(round(area ** 0.5))
+    return max(1, size)
+
+
 def params_to_matrix(params):
     """params: (6,) array (rz, ry, rx, tx, ty, tz). Returns (4, 4) image_mm transform."""
     rz, ry, rx, tx, ty, tz = params
@@ -361,10 +373,12 @@ def main():
     image_points = reference_image_points((IMG_H, IMG_W)).numpy()  # (4, P)
 
     print(f"[{get_time()}] Loading model from {args.ckpt}... (backbone={args.backbone})")
-    model = FiMANetMamba6DOF(seq_len=SEQ_LEN, pair_encoder=True, pair_strides=PAIR_STRIDES,
-                              backbone=args.backbone).to(DEVICE)
     ckpt = torch.load(args.ckpt, map_location=DEVICE)
     state_dict = ckpt['model_state_dict'] if isinstance(ckpt, dict) and 'model_state_dict' in ckpt else ckpt
+    pool_size = infer_pool_size(state_dict, args.backbone)
+    print(f"[{get_time()}] Inferred pool_size={pool_size} from checkpoint.")
+    model = FiMANetMamba6DOF(seq_len=SEQ_LEN, pair_encoder=True, pair_strides=PAIR_STRIDES,
+                              backbone=args.backbone, pool_size=pool_size).to(DEVICE)
     model.load_state_dict(state_dict)
     model.eval()
 

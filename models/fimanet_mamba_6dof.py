@@ -22,16 +22,16 @@ class PositionalEncoding(nn.Module):
 class FiMANetMamba6DOF(nn.Module):
     """6-DoF variant of FiMANetMamba.
 
-    Output convention matches the TUS-REC2024 baseline 'parameter' pred_type:
-    (rx, ry, rz, tx, ty, tz) — ZYX Euler angles + translations, denoting the
-    transformation from the current frame to the previous frame in image_mm
-    coordinates (the calibration's image-mm frame, not the tool frame).
+    Output: (rz, ry, rx, tx, ty, tz) — ZYX Euler + translation, frame_{i+1} -> frame_i in
+    the image_mm frame. Channel order (rz,ry,rx) matches train/eval decode; do NOT reorder.
+    pool_size / freeze_early default to the old architecture (2x2 pool, stem+layer1 frozen)
+    so old checkpoints load; training passes larger pool + trainable stem/layer1.
     """
 
     def __init__(self, seq_len=20, hidden_size=256, num_layers=2,
                  pair_encoder=True, pair_strides=(1,),
                  mamba_d_state=16, mamba_d_conv=4, mamba_expand=2,
-                 backbone='resnet18'):
+                 backbone='resnet18', pool_size=2, freeze_early=True):
         super().__init__()
         self.seq_len = seq_len
         self.pair_encoder = pair_encoder
@@ -68,13 +68,16 @@ class FiMANetMamba6DOF(nn.Module):
         self.layer3 = base.layer3
         self.layer4 = base.layer4
 
-        for p in self.stem.parameters():   p.requires_grad = False
-        for p in self.layer1.parameters(): p.requires_grad = False
+        # Unfreeze stem+layer1 (freeze_early=False) so conv1 can learn US speckle — the
+        # only out-of-plane (tz) cue. freeze_early=True = old frozen backbone.
+        if freeze_early:
+            for p in self.stem.parameters():   p.requires_grad = False
+            for p in self.layer1.parameters(): p.requires_grad = False
 
-        self.pool = nn.AdaptiveAvgPool2d((2, 2))
-
-        # Fusion: (ch2 + ch3 + ch4) × 4 patches → hidden_size
-        fusion_in = (ch2 + ch3 + ch4) * 4
+        # Larger pool preserves speckle that 2x2 averaged away. pool_size=2 = old behavior.
+        self.pool_size = pool_size
+        self.pool = nn.AdaptiveAvgPool2d((pool_size, pool_size))
+        fusion_in = (ch2 + ch3 + ch4) * pool_size * pool_size
         self.fusion = nn.Sequential(
             nn.Linear(fusion_in, hidden_size),
             nn.LayerNorm(hidden_size),

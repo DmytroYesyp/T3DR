@@ -1,0 +1,12 @@
+*.png
+/runs_local
+*.log
+*.tmp
+__pycache__/
+*.csv
+*.pdf
+*.xml
+*.txt
+*.md
+*.pptx
+*.ipynb
