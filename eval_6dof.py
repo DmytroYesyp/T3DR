@@ -90,6 +90,17 @@ def infer_pool_size(state_dict, backbone):
     return max(1, size)
 
 
+def infer_seq_len(state_dict, default=SEQ_LEN):
+    """Recover seq_len from the positional-encoding buffer shape [1, seq_len, d]."""
+    pe = state_dict.get('pos_encoder.pe')
+    return int(pe.shape[1]) if pe is not None else default
+
+
+def infer_bidirectional(state_dict):
+    """Bidirectional checkpoints have temporal_layers.*.fwd/.bwd submodules."""
+    return any('temporal_layers' in k and '.fwd.' in k for k in state_dict)
+
+
 def params_to_matrix(params):
     """params: (6,) array (rz, ry, rx, tx, ty, tz). Returns (4, 4) image_mm transform."""
     rz, ry, rx, tx, ty, tz = params
@@ -174,7 +185,7 @@ def cal_dist(label, pred, mode='all'):
 # ---------------------------------------------------------------------------
 # Model inference with sliding window
 # ---------------------------------------------------------------------------
-def predict_local_params(model, frames):
+def predict_local_params(model, frames, seq_len=SEQ_LEN):
     """Predict local 6-DoF params for every frame transition i -> i+1.
     frames: (N, H, W) numpy.
     Returns: (N-1, 6) numpy.
@@ -182,12 +193,9 @@ def predict_local_params(model, frames):
     N = len(frames)
     params = np.zeros((N - 1, 6), dtype=np.float32)
 
-    # Sliding window: for window starting at start_idx, last output position predicts
-    # transition (start_idx + SEQ_LEN - 2) -> (start_idx + SEQ_LEN - 1) under pair_strides=(1,).
-    # We slide such that we cover every transition from index (SEQ_LEN - 2) to (N - 2).
-    # The pair encoder loses 1 position, so out_len = SEQ_LEN - 1.
-
-    last_pos_offset = SEQ_LEN - 2  # output position [-1] corresponds to (start+18) -> (start+19)
+    # Sliding window: each window's last output position predicts transition
+    # (start + seq_len - 2) -> (start + seq_len - 1) under pair_strides=(1,).
+    last_pos_offset = seq_len - 2
 
     # Pre-resize all frames once
     resized = np.zeros((N, 1, INFER_H, INFER_W), dtype=np.float32)
@@ -203,8 +211,8 @@ def predict_local_params(model, frames):
     LOSS_START_POS = 5
 
     with torch.no_grad():
-        for start in range(0, N - SEQ_LEN + 1):
-            window = torch.from_numpy(resized[start:start + SEQ_LEN]).unsqueeze(0).to(DEVICE)
+        for start in range(0, N - seq_len + 1):
+            window = torch.from_numpy(resized[start:start + seq_len]).unsqueeze(0).to(DEVICE)
             out = model(window)  # [1, L, 6]
             out_np_all = out[0].float().cpu().numpy()  # [L, 6]
 
@@ -229,11 +237,11 @@ def predict_local_params(model, frames):
     return params
 
 
-def predict_global_local_matrices(model, frames, image_mm_to_tool):
+def predict_global_local_matrices(model, frames, image_mm_to_tool, seq_len=SEQ_LEN):
     """Returns predicted (transformation_global, transformation_local) each (N-1, 4, 4)
     in the image_mm coordinate system."""
     N = len(frames)
-    local_params = predict_local_params(model, frames)
+    local_params = predict_local_params(model, frames, seq_len)
     local_mats = np.zeros((N - 1, 4, 4), dtype=np.float32)
     for i in range(N - 1):
         local_mats[i] = params_to_matrix(local_params[i])
@@ -376,9 +384,12 @@ def main():
     ckpt = torch.load(args.ckpt, map_location=DEVICE)
     state_dict = ckpt['model_state_dict'] if isinstance(ckpt, dict) and 'model_state_dict' in ckpt else ckpt
     pool_size = infer_pool_size(state_dict, args.backbone)
-    print(f"[{get_time()}] Inferred pool_size={pool_size} from checkpoint.")
-    model = FiMANetMamba6DOF(seq_len=SEQ_LEN, pair_encoder=True, pair_strides=PAIR_STRIDES,
-                              backbone=args.backbone, pool_size=pool_size).to(DEVICE)
+    seq_len = infer_seq_len(state_dict)
+    bidirectional = infer_bidirectional(state_dict)
+    print(f"[{get_time()}] Inferred from ckpt: pool_size={pool_size} seq_len={seq_len} bidirectional={bidirectional}")
+    model = FiMANetMamba6DOF(seq_len=seq_len, pair_encoder=True, pair_strides=PAIR_STRIDES,
+                              backbone=args.backbone, pool_size=pool_size,
+                              bidirectional=bidirectional).to(DEVICE)
     model.load_state_dict(state_dict)
     model.eval()
 
@@ -405,7 +416,7 @@ def main():
 
         # Model inference once
         pure_global, pure_local, pure_local_params = predict_global_local_matrices(
-            model, frames, image_mm_to_tool)
+            model, frames, image_mm_to_tool, seq_len)
 
         # GT once
         gt_local  = tforms_to_local_image_mm(tforms, image_mm_to_tool)

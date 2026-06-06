@@ -19,6 +19,18 @@ class PositionalEncoding(nn.Module):
         return x + self.pe[:, :x.size(1), :]
 
 
+class BiMamba(nn.Module):
+    """Forward + backward Mamba pass, summed. Gives each frame future context so the
+    out-of-plane (tz) sign can be resolved (a causal pass cannot)."""
+    def __init__(self, d_model, d_state, d_conv, expand):
+        super().__init__()
+        self.fwd = Mamba(d_model=d_model, d_state=d_state, d_conv=d_conv, expand=expand)
+        self.bwd = Mamba(d_model=d_model, d_state=d_state, d_conv=d_conv, expand=expand)
+
+    def forward(self, x):
+        return self.fwd(x) + self.bwd(x.flip(1)).flip(1)
+
+
 class FiMANetMamba6DOF(nn.Module):
     """6-DoF variant of FiMANetMamba.
 
@@ -31,7 +43,7 @@ class FiMANetMamba6DOF(nn.Module):
     def __init__(self, seq_len=20, hidden_size=256, num_layers=2,
                  pair_encoder=True, pair_strides=(1,),
                  mamba_d_state=16, mamba_d_conv=4, mamba_expand=2,
-                 backbone='resnet18', pool_size=2, freeze_early=True):
+                 backbone='resnet18', pool_size=2, freeze_early=True, bidirectional=False):
         super().__init__()
         self.seq_len = seq_len
         self.pair_encoder = pair_encoder
@@ -95,11 +107,12 @@ class FiMANetMamba6DOF(nn.Module):
             )
 
         self.pos_encoder = PositionalEncoding(hidden_size, max_len=seq_len)
-        self.temporal_layers = nn.ModuleList([
-            Mamba(d_model=hidden_size, d_state=mamba_d_state,
-                  d_conv=mamba_d_conv, expand=mamba_expand)
-            for _ in range(num_layers)
-        ])
+        def _temporal():
+            if bidirectional:
+                return BiMamba(hidden_size, mamba_d_state, mamba_d_conv, mamba_expand)
+            return Mamba(d_model=hidden_size, d_state=mamba_d_state,
+                         d_conv=mamba_d_conv, expand=mamba_expand)
+        self.temporal_layers = nn.ModuleList([_temporal() for _ in range(num_layers)])
 
         self.head = nn.Sequential(
             nn.Linear(hidden_size, 128),

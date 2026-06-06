@@ -20,8 +20,9 @@ from models.fimanet_mamba_6dof import FiMANetMamba6DOF
 # CONFIG
 # =============================================================================
 DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-SEQ_LEN = 20
-BATCH_SIZE = 48        # half-res frees memory; drop to 32/24 if OOM
+SEQ_LEN = 60
+BATCH_SIZE = 24
+WINDOW_STRIDE = 3      # subsample window starts (adjacent 60-frame windows are ~98% redundant)
 EPOCHS = 15            # best ckpt saved each epoch — stop early once GPEproxy flattens
 WARMUP_EPOCHS = 4
 PAIR_STRIDES = (1,)
@@ -31,9 +32,9 @@ BACKBONE = os.environ.get("BACKBONE", "resnet18")  # resnet18 | resnet34 | resne
 LOSS_START_POS = 5
 W_GLOBAL  = 0.2   # global-accumulation corner consistency
 W_PEARSON = 0.5   # case-wise Pearson on 6-DoF trajectory (FiMoNet)
-# Architecture: restore the speckle/tz cue (was 2x2 pool + frozen stem/layer1).
 POOL_SIZE    = 7
 FREEZE_EARLY = False
+BIDIRECTIONAL = True
 ZREVERSE_P = 0.12     # frame-reversal aug; targets recomputed from reversed poses
 GPE_PROXY_SCANS = 6   # full val scans for the per-epoch GPE proxy
 
@@ -403,7 +404,7 @@ class LargeUSDataset6DOF(Dataset):
                         if 'frames' not in f or 'tforms' not in f:
                             continue
                         n = f['frames'].shape[0]
-                        for i in range(0, n - seq_len):
+                        for i in range(0, n - seq_len, WINDOW_STRIDE):
                             self.samples.append({'path': fp, 'start': i})
                 except Exception as e:
                     print(f"err {fp}: {e}")
@@ -664,12 +665,13 @@ if __name__ == '__main__':
     print(f"[{get_time()}] --- STEP 2: BUILD + TRAIN MODEL ---")
     print(f"[{get_time()}] Backbone: {BACKBONE}")
     model = FiMANetMamba6DOF(seq_len=SEQ_LEN, pair_encoder=True, pair_strides=PAIR_STRIDES,
-                              backbone=BACKBONE, pool_size=POOL_SIZE, freeze_early=FREEZE_EARLY)
+                              backbone=BACKBONE, pool_size=POOL_SIZE, freeze_early=FREEZE_EARLY,
+                              bidirectional=BIDIRECTIONAL)
     n_params = sum(p.numel() for p in model.parameters())
     n_train = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"[{get_time()}] Total params: {n_params/1e6:.1f}M ({n_train/1e6:.1f}M trainable) | "
-          f"pool={POOL_SIZE}x{POOL_SIZE} freeze_early={FREEZE_EARLY} | "
-          f"loss: point + {W_GLOBAL}*global + {W_PEARSON}*pearson | zrev_p={ZREVERSE_P}")
+          f"seq={SEQ_LEN} stride={WINDOW_STRIDE} bidir={BIDIRECTIONAL} pool={POOL_SIZE}x{POOL_SIZE} "
+          f"freeze_early={FREEZE_EARLY} | loss: point + {W_GLOBAL}*global + {W_PEARSON}*pearson | zrev_p={ZREVERSE_P}")
     best_path = train_model(run_name, run_dir, model, train_loader, val_loader, EPOCHS,
                             image_points_mm_torch,
                             proxy_scans=proxy_scans, image_mm_to_tool=image_mm_to_tool,
