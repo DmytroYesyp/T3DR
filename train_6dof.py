@@ -20,9 +20,13 @@ from models.fimanet_mamba_6dof import FiMANetMamba6DOF
 # CONFIG
 # =============================================================================
 DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-SEQ_LEN = 60
-BATCH_SIZE = 24
-WINDOW_STRIDE = 3      # subsample window starts (adjacent 60-frame windows are ~98% redundant)
+# Faithful FiMoNet recipe: variable-length windows + random interval, batch 1 + grad accum, full-scan.
+SEQ_LEN_MIN, SEQ_LEN_MAX = 60, 180
+SEQ_LEN = SEQ_LEN_MAX                 # PE buffer + val window length
+FRAME_INTERVALS = (1, 2, 3)           # random temporal subsampling
+BATCH_SIZE = 1                        # variable lengths -> batch 1
+GRAD_ACCUM = 12                       # effective batch ~12
+WINDOW_STRIDE = 16
 EPOCHS = 15            # best ckpt saved each epoch — stop early once GPEproxy flattens
 WARMUP_EPOCHS = 4
 PAIR_STRIDES = (1,)
@@ -59,6 +63,11 @@ VAL_PER_SUBJECT = 24
 # =============================================================================
 def get_time():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _seed_worker(worker_id):
+    # Per-worker numpy seed so random window length/interval differ across workers.
+    np.random.seed((torch.initial_seed() + worker_id) % (2 ** 32))
 
 
 RUNS_ROOT = "runs"
@@ -276,10 +285,8 @@ def _np_tforms_to_global(tforms, image_mm_to_tool):
 
 
 def _predict_local_params_np(model, frames):
-    """Sliding-window inference over a full scan (mirrors eval_6dof.predict_local_params)."""
+    """Full-scan inference: whole scan in one pass -> (N-1, 6) (matches eval --fullscan)."""
     N = len(frames)
-    params = np.zeros((N - 1, 6), dtype=np.float32)
-    last_pos_offset = SEQ_LEN - 2
     resized = np.zeros((N, 1, NET_H, NET_W), dtype=np.float32)
     for i in range(N):
         img = cv2.resize(frames[i], (NET_W, NET_H))
@@ -288,21 +295,10 @@ def _predict_local_params_np(model, frames):
         resized[i, 0] = img.astype(np.float32)
     model.eval()
     with torch.no_grad():
-        for start in range(0, N - SEQ_LEN + 1):
-            window = torch.from_numpy(resized[start:start + SEQ_LEN]).unsqueeze(0).to(DEVICE)
-            with autocast(device_type='cuda', dtype=torch.float16):
-                out = model(window)
-            out_np = out[0].float().cpu().numpy()
-            if start == 0:
-                L = out_np.shape[0]
-                fb = out_np[min(LOSS_START_POS, L - 1)]
-                for p in range(L - 1):
-                    if 0 <= start + p < N - 1:
-                        params[start + p] = out_np[p] if p >= LOSS_START_POS else fb
-            t_idx = start + last_pos_offset
-            if 0 <= t_idx < N - 1:
-                params[t_idx] = out_np[-1]
-    return params
+        seq = torch.from_numpy(resized).unsqueeze(0).to(DEVICE)  # [1, N, 1, H, W]
+        with autocast(device_type='cuda', dtype=torch.float16):
+            out = model(seq)
+    return out[0].float().cpu().numpy()  # (N-1, 6)
 
 
 def compute_gpe_proxy(model, proxy_scans, image_mm_to_tool, image_points_mm):
@@ -404,8 +400,11 @@ class LargeUSDataset6DOF(Dataset):
                         if 'frames' not in f or 'tforms' not in f:
                             continue
                         n = f['frames'].shape[0]
-                        for i in range(0, n - seq_len, WINDOW_STRIDE):
-                            self.samples.append({'path': fp, 'start': i})
+                        if n < SEQ_LEN_MIN + 2:
+                            continue
+                        # leave room for at least SEQ_LEN_MIN frames at interval 1
+                        for i in range(0, n - SEQ_LEN_MIN, WINDOW_STRIDE):
+                            self.samples.append({'path': fp, 'start': i, 'n': n})
                 except Exception as e:
                     print(f"err {fp}: {e}")
         print(f"[{get_time()}] Indexed {len(self.samples)} sequences.")
@@ -431,28 +430,32 @@ class LargeUSDataset6DOF(Dataset):
 
     def __getitem__(self, idx):
         m = self.samples[idx]
+        start, n = m['start'], m['n']
+        # Random window length + interval (FiMoNet aug); fall back to interval 1 near the end.
+        s = int(np.random.choice(FRAME_INTERVALS))
+        L = int(np.random.randint(SEQ_LEN_MIN, SEQ_LEN_MAX + 1))
+        if start + L * s > n - 1:
+            s = 1
+            L = min(L, n - 1 - start)
         with h5py.File(m['path'], 'r') as f:
-            frames = f['frames'][m['start']:m['start'] + self.seq_len]
-            tforms = f['tforms'][m['start']:m['start'] + self.seq_len + 1].astype(np.float32)
+            frames = f['frames'][start:start + L * s:s][:L]
+            tforms = f['tforms'][start:start + L * s + 1:s][:L + 1].astype(np.float32)
 
-        # Z-reverse aug at low p: reverse frame order so the model learns both sweep
-        # directions (kills the tz sign prior). Targets recomputed from reversed poses.
+        # Z-reverse aug: reverse frame order; targets recomputed from reversed poses.
         if self.augment and np.random.rand() < ZREVERSE_P:
             frames = frames[::-1].copy()
-            poses = tforms[:self.seq_len][::-1]
-            tforms = np.concatenate([poses, tforms[:1]], axis=0).copy()  # +1 throwaway pose
+            tforms = np.concatenate([tforms[:L][::-1], tforms[:1]], axis=0).copy()  # L+1 poses
 
         seq = []
-        for i in range(self.seq_len):
-            img = frames[i]
-            img = cv2.resize(img, (NET_W, NET_H))  # native 480x640, preserves speckle + aspect ratio
+        for i in range(L):
+            img = cv2.resize(frames[i], (NET_W, NET_H))  # half-res, preserves speckle + aspect
             if img.max() > 1.0:
                 img = img / 255.0
             seq.append(np.expand_dims(img, axis=0).astype(np.float32))
         if self.augment:
             seq = self._augment_intensity(seq)
 
-        seq_tensor = torch.tensor(np.stack(seq), dtype=torch.float32)
+        seq_tensor    = torch.tensor(np.stack(seq), dtype=torch.float32)
         target        = tforms_to_target_points(tforms, self.image_mm_to_tool, self.image_points_mm)
         target_params = tforms_to_6dof_params(tforms, self.image_mm_to_tool)
         return (seq_tensor,
@@ -540,24 +543,34 @@ def train_model(run_name, run_dir, model, train_loader, val_loader, epochs, imag
 
         model.train()
         train_loss = 0.0
+        optimizer.zero_grad()
+        i = -1
         for i, (seqs, target_pts, target_prm) in enumerate(train_loader):
             seqs       = seqs.to(DEVICE, non_blocking=True)
             target_pts = target_pts.to(DEVICE, non_blocking=True)
             target_prm = target_prm.to(DEVICE, non_blocking=True)
-            optimizer.zero_grad()
             with autocast(device_type='cuda', dtype=torch.float16):
-                outputs = model(seqs)             # [B, L, 6]
+                outputs = model(seqs)             # [1, L, 6]
                 loss    = criterion(outputs, target_pts, target_prm)  # point + global + pearson
-            scaler.scale(loss).backward()
+            scaler.scale(loss / GRAD_ACCUM).backward()
+            if (i + 1) % GRAD_ACCUM == 0:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad()
+            train_loss += loss.item()
+            if i % 500 == 0:
+                print(f"[{get_time()}] Ep {epoch+1} | Batch {i}/{total_batches} | Loss: {loss.item():.4f} mm")
+        # flush any remaining accumulated gradients
+        if (i + 1) % GRAD_ACCUM != 0:
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
             scaler.step(optimizer)
             scaler.update()
-            train_loss += loss.item()
-            if i % 100 == 0:
-                print(f"[{get_time()}] Ep {epoch+1} | Batch {i}/{total_batches} | Loss: {loss.item():.4f} mm")
+            optimizer.zero_grad()
 
-        avg_train = train_loss / total_batches
+        avg_train = train_loss / max(total_batches, 1)
 
         # Validation: same point-based loss + max-corner-error sanity metric
         model.eval()
@@ -629,21 +642,22 @@ if __name__ == '__main__':
     print(f"[{get_time()}] Run dir: {run_dir}")
 
     print(f"[{get_time()}] --- STEP 1: DATASETS ---")
-    train_ds = LargeUSDataset6DOF(TRAIN_FOLDERS, seq_len=SEQ_LEN,
+    train_ds = LargeUSDataset6DOF(TRAIN_FOLDERS, seq_len=SEQ_LEN_MIN,
                                    image_mm_to_tool=image_mm_to_tool,
                                    image_points_mm=image_points_mm, augment=True)
     train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True,
-                              num_workers=4, pin_memory=True)
+                              num_workers=4, pin_memory=True, worker_init_fn=_seed_worker)
 
     val_pairs = collect_val_files_stratified(VAL_PER_SUBJECT)
     n_subj = len({c.split('/')[0] for _, _, c in val_pairs})
     print(f"[{get_time()}] Validation set: {len(val_pairs)} cases across {n_subj} subject(s)")
-    val_datasets = [MemoryUSDataset6DOF(fp, tp, seq_len=SEQ_LEN,
+    # Val uses a fixed window length (secondary log metric; selection is the GPE proxy).
+    val_datasets = [MemoryUSDataset6DOF(fp, tp, seq_len=SEQ_LEN_MIN,
                                          image_mm_to_tool=image_mm_to_tool,
                                          image_points_mm=image_points_mm)
                     for fp, tp, _ in val_pairs]
     val_ds = ConcatDataset(val_datasets)
-    val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=2, pin_memory=True)
+    val_loader = DataLoader(val_ds, batch_size=12, shuffle=False, num_workers=2, pin_memory=True)
 
     # Full-scan val subset for the per-epoch GPE proxy.
     proxy_scans = []
@@ -664,14 +678,16 @@ if __name__ == '__main__':
 
     print(f"[{get_time()}] --- STEP 2: BUILD + TRAIN MODEL ---")
     print(f"[{get_time()}] Backbone: {BACKBONE}")
-    model = FiMANetMamba6DOF(seq_len=SEQ_LEN, pair_encoder=True, pair_strides=PAIR_STRIDES,
+    model = FiMANetMamba6DOF(seq_len=SEQ_LEN_MAX, pair_encoder=True, pair_strides=PAIR_STRIDES,
                               backbone=BACKBONE, pool_size=POOL_SIZE, freeze_early=FREEZE_EARLY,
                               bidirectional=BIDIRECTIONAL)
     n_params = sum(p.numel() for p in model.parameters())
     n_train = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"[{get_time()}] Total params: {n_params/1e6:.1f}M ({n_train/1e6:.1f}M trainable) | "
-          f"seq={SEQ_LEN} stride={WINDOW_STRIDE} bidir={BIDIRECTIONAL} pool={POOL_SIZE}x{POOL_SIZE} "
-          f"freeze_early={FREEZE_EARLY} | loss: point + {W_GLOBAL}*global + {W_PEARSON}*pearson | zrev_p={ZREVERSE_P}")
+          f"seq={SEQ_LEN_MIN}-{SEQ_LEN_MAX} interval={FRAME_INTERVALS} stride={WINDOW_STRIDE} "
+          f"batch={BATCH_SIZE}x{GRAD_ACCUM}accum bidir={BIDIRECTIONAL} pool={POOL_SIZE}x{POOL_SIZE} "
+          f"freeze_early={FREEZE_EARLY} | loss: point + {W_GLOBAL}*global + {W_PEARSON}*pearson | "
+          f"zrev_p={ZREVERSE_P} | full-scan proxy")
     best_path = train_model(run_name, run_dir, model, train_loader, val_loader, EPOCHS,
                             image_points_mm_torch,
                             proxy_scans=proxy_scans, image_mm_to_tool=image_mm_to_tool,
