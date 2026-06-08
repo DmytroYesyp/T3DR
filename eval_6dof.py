@@ -237,11 +237,28 @@ def predict_local_params(model, frames, seq_len=SEQ_LEN):
     return params
 
 
-def predict_global_local_matrices(model, frames, image_mm_to_tool, seq_len=SEQ_LEN):
+def predict_local_params_fullscan(model, frames):
+    """Whole-scan single pass: feed all N frames at once -> (N-1, 6). Needs the
+    length-agnostic PositionalEncoding. No sliding window, no fallback fill."""
+    N = len(frames)
+    resized = np.zeros((N, 1, INFER_H, INFER_W), dtype=np.float32)
+    for i in range(N):
+        img = cv2.resize(frames[i], (INFER_W, INFER_H))
+        if img.max() > 1.0:
+            img = img / 255.0
+        resized[i, 0] = img.astype(np.float32)
+    with torch.no_grad():
+        seq = torch.from_numpy(resized).unsqueeze(0).to(DEVICE)  # [1, N, 1, H, W]
+        out = model(seq)
+    return out[0].float().cpu().numpy()  # (N-1, 6)
+
+
+def predict_global_local_matrices(model, frames, image_mm_to_tool, seq_len=SEQ_LEN, fullscan=False):
     """Returns predicted (transformation_global, transformation_local) each (N-1, 4, 4)
     in the image_mm coordinate system."""
     N = len(frames)
-    local_params = predict_local_params(model, frames, seq_len)
+    local_params = (predict_local_params_fullscan(model, frames) if fullscan
+                    else predict_local_params(model, frames, seq_len))
     local_mats = np.zeros((N - 1, 4, 4), dtype=np.float32)
     for i in range(N - 1):
         local_mats[i] = params_to_matrix(local_params[i])
@@ -368,6 +385,8 @@ def main():
                         help="pure: model gives all 6 DoF; hybrid: LK gives (tx, ty), model gives rest; both: comparison")
     parser.add_argument('--backbone', choices=['resnet18', 'resnet34', 'resnet50'], default='resnet18',
                         help="Must match the backbone used during training of the checkpoint.")
+    parser.add_argument('--fullscan', action='store_true',
+                        help="Feed the whole scan in one pass instead of sliding seq_len windows.")
     args = parser.parse_args()
     do_pure = args.mode in ('pure', 'both')
     do_hybrid = args.mode in ('hybrid', 'both')
@@ -396,7 +415,7 @@ def main():
     val_files = collect_val_files()
     if args.limit:
         val_files = val_files[:args.limit]
-    print(f"[{get_time()}] Eval set: {len(val_files)} scans")
+    print(f"[{get_time()}] Eval set: {len(val_files)} scans | inference={'FULL-SCAN' if args.fullscan else 'sliding-window'}")
 
     metrics = {
         'pure':   {'gpe': [], 'gle': [], 'lpe': [], 'lle': []},
@@ -416,7 +435,7 @@ def main():
 
         # Model inference once
         pure_global, pure_local, pure_local_params = predict_global_local_matrices(
-            model, frames, image_mm_to_tool, seq_len)
+            model, frames, image_mm_to_tool, seq_len, fullscan=args.fullscan)
 
         # GT once
         gt_local  = tforms_to_local_image_mm(tforms, image_mm_to_tool)

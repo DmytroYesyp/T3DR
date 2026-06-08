@@ -8,6 +8,7 @@ from mamba_ssm import Mamba
 class PositionalEncoding(nn.Module):
     def __init__(self, d_model, max_len=100):
         super().__init__()
+        self.d_model = d_model
         pe = torch.zeros(max_len, d_model)
         position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
         div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
@@ -16,7 +17,17 @@ class PositionalEncoding(nn.Module):
         self.register_buffer('pe', pe.unsqueeze(0))
 
     def forward(self, x):
-        return x + self.pe[:, :x.size(1), :]
+        L = x.size(1)
+        if L <= self.pe.size(1):
+            return x + self.pe[:, :L, :]
+        # Full-scan inference: sequence longer than the trained buffer. Extend the same
+        # sinusoid on the fly (positions 0..max-1 are identical, so <=max is unchanged).
+        pos = torch.arange(L, dtype=torch.float, device=x.device).unsqueeze(1)
+        div = torch.exp(torch.arange(0, self.d_model, 2, device=x.device).float() * (-math.log(10000.0) / self.d_model))
+        pe = torch.zeros(L, self.d_model, device=x.device)
+        pe[:, 0::2] = torch.sin(pos * div)
+        pe[:, 1::2] = torch.cos(pos * div)
+        return x + pe.unsqueeze(0)
 
 
 class BiMamba(nn.Module):
