@@ -183,82 +183,114 @@ def cal_dist(label, pred, mode='all'):
 
 
 # ---------------------------------------------------------------------------
-# Model inference with sliding window
+# Model inference
 # ---------------------------------------------------------------------------
-def predict_local_params(model, frames, seq_len=SEQ_LEN):
-    """Predict local 6-DoF params for every frame transition i -> i+1.
-    frames: (N, H, W) numpy.
-    Returns: (N-1, 6) numpy.
-    Missing positions (where the sliding window can't reach) are filled with identity (zeros)."""
+LOSS_START_POS = 5   # positions below this were masked from the training loss
+WINDOW_BATCH = 16    # sliding windows per forward pass
+
+
+def _resize_frames(frames):
     N = len(frames)
-    params = np.zeros((N - 1, 6), dtype=np.float32)
-
-    # Sliding window: each window's last output position predicts transition
-    # (start + seq_len - 2) -> (start + seq_len - 1) under pair_strides=(1,).
-    last_pos_offset = seq_len - 2
-
-    # Pre-resize all frames once
     resized = np.zeros((N, 1, INFER_H, INFER_W), dtype=np.float32)
     for i in range(N):
         img = cv2.resize(frames[i], (INFER_W, INFER_H))
         if img.max() > 1.0:
             img = img / 255.0
         resized[i, 0] = img.astype(np.float32)
+    return resized
 
-    # Positions [0..LOSS_START_POS-1] were masked from the training loss (see
-    # PointBasedLoss in train_6dof.py: start_pos=5). The model has no supervision at
-    # those positions, so we fall back to its prediction at LOSS_START_POS for them.
-    LOSS_START_POS = 5
 
+def predict_local_params(model, resized, seq_len=SEQ_LEN, avg_window=False):
+    """Sliding-window prediction. resized: (N, 1, H, W). Returns (N-1, 6).
+    avg_window=False: legacy — each transition read at its window's LAST output position,
+    where the backward Mamba direction has zero future context.
+    avg_window=True: average each transition over all window positions with >=5 frames of
+    past AND future context (fallback: any supervised position, then the legacy early fill)."""
+    N = len(resized)
+    params = np.zeros((N - 1, 6), dtype=np.float32)
+    starts = list(range(0, N - seq_len + 1))
+    outs = np.zeros((len(starts), seq_len - 1, 6), dtype=np.float32)
     with torch.no_grad():
-        for start in range(0, N - seq_len + 1):
-            window = torch.from_numpy(resized[start:start + seq_len]).unsqueeze(0).to(DEVICE)
-            out = model(window)  # [1, L, 6]
-            out_np_all = out[0].float().cpu().numpy()  # [L, 6]
+        for c in range(0, len(starts), WINDOW_BATCH):
+            chunk = starts[c:c + WINDOW_BATCH]
+            batch = torch.from_numpy(np.stack([resized[s:s + seq_len] for s in chunk])).to(DEVICE)
+            outs[c:c + len(chunk)] = model(batch).float().cpu().numpy()
 
-            if start == 0:
-                # First window: use the model's own predictions at every output position
-                # to populate the early transitions that no later window can reach with
-                # its last-position output. Positions before LOSS_START_POS use a
-                # supervised fallback (output at LOSS_START_POS), because they were never
-                # trained directly.
-                L = out_np_all.shape[0]
-                fallback = out_np_all[min(LOSS_START_POS, L - 1)]
-                for p in range(L - 1):              # positions 0 .. L-2
-                    t_idx = start + p
-                    if 0 <= t_idx < N - 1:
-                        params[t_idx] = out_np_all[p] if p >= LOSS_START_POS else fallback
+    first = outs[0]
+    fallback = first[min(LOSS_START_POS, first.shape[0] - 1)]
 
-            # Always: each window's last output position has the most temporal context
-            t_idx = start + last_pos_offset
-            if 0 <= t_idx < N - 1:
-                params[t_idx] = out_np_all[-1]
+    if not avg_window:
+        for p in range(first.shape[0] - 1):
+            if p < N - 1:
+                params[p] = first[p] if p >= LOSS_START_POS else fallback
+        for w, s in enumerate(starts):
+            t = s + seq_len - 2
+            if 0 <= t < N - 1:
+                params[t] = outs[w][-1]
+        return params
 
+    p_hi = seq_len - 7  # >=5 future frames within the window
+    sum_mid = np.zeros((N - 1, 6)); cnt_mid = np.zeros(N - 1, dtype=np.int64)
+    sum_any = np.zeros((N - 1, 6)); cnt_any = np.zeros(N - 1, dtype=np.int64)
+    for w, s in enumerate(starts):
+        for p in range(LOSS_START_POS, seq_len - 1):
+            t = s + p
+            if t >= N - 1:
+                break
+            sum_any[t] += outs[w][p]; cnt_any[t] += 1
+            if p <= p_hi:
+                sum_mid[t] += outs[w][p]; cnt_mid[t] += 1
+    for t in range(N - 1):
+        if cnt_mid[t]:
+            params[t] = sum_mid[t] / cnt_mid[t]
+        elif cnt_any[t]:
+            params[t] = sum_any[t] / cnt_any[t]
+        else:
+            params[t] = fallback
     return params
 
 
-def predict_local_params_fullscan(model, frames):
-    """Whole-scan single pass: feed all N frames at once -> (N-1, 6). Needs the
-    length-agnostic PositionalEncoding. No sliding window, no fallback fill."""
-    N = len(frames)
-    resized = np.zeros((N, 1, INFER_H, INFER_W), dtype=np.float32)
-    for i in range(N):
-        img = cv2.resize(frames[i], (INFER_W, INFER_H))
-        if img.max() > 1.0:
-            img = img / 255.0
-        resized[i, 0] = img.astype(np.float32)
+def predict_local_params_fullscan(model, resized):
+    """Whole-scan single pass -> (N-1, 6). Needs the length-agnostic PositionalEncoding."""
     with torch.no_grad():
-        seq = torch.from_numpy(resized).unsqueeze(0).to(DEVICE)  # [1, N, 1, H, W]
+        seq = torch.from_numpy(np.ascontiguousarray(resized)).unsqueeze(0).to(DEVICE)
         out = model(seq)
     return out[0].float().cpu().numpy()  # (N-1, 6)
 
 
-def predict_global_local_matrices(model, frames, image_mm_to_tool, seq_len=SEQ_LEN, fullscan=False):
-    """Returns predicted (transformation_global, transformation_local) each (N-1, 4, 4)
+def invert_params_seq(params):
+    """(M, 6) -> (M, 6): the 6-DoF params of each inverted transform."""
+    out = np.zeros_like(params)
+    for i, p in enumerate(params):
+        Ti = np.linalg.inv(params_to_matrix(p))
+        rz, ry, rx = Rotation.from_matrix(Ti[:3, :3]).as_euler('ZYX')
+        out[i] = (rz, ry, rx, Ti[0, 3], Ti[1, 3], Ti[2, 3])
+    return out
+
+
+def predict_params_one(model, resized, seq_len, fullscan=False, avg_window=False, reverse_tta=False):
+    """Per-model prediction with optional reverse TTA: predict the reversed scan, map its
+    locals back to forward (reverse order + invert) and average — a direction-coherent tz
+    bias flips sign under reversal and cancels."""
+    def _run(r):
+        return (predict_local_params_fullscan(model, r) if fullscan
+                else predict_local_params(model, r, seq_len, avg_window))
+    fwd = _run(resized)
+    if not reverse_tta:
+        return fwd
+    rev = _run(resized[::-1].copy())
+    return ((fwd + invert_params_seq(rev[::-1])) / 2.0).astype(np.float32)
+
+
+def predict_global_local_matrices(models, frames, seq_lens, fullscan=False,
+                                  avg_window=False, reverse_tta=False):
+    """Ensemble-mean local params across models -> (global, local, params) matrices
     in the image_mm coordinate system."""
     N = len(frames)
-    local_params = (predict_local_params_fullscan(model, frames) if fullscan
-                    else predict_local_params(model, frames, seq_len))
+    resized = _resize_frames(frames)
+    all_params = [predict_params_one(m, resized, sl, fullscan, avg_window, reverse_tta)
+                  for m, sl in zip(models, seq_lens)]
+    local_params = np.mean(all_params, axis=0).astype(np.float32)
     local_mats = np.zeros((N - 1, 4, 4), dtype=np.float32)
     for i in range(N - 1):
         local_mats[i] = params_to_matrix(local_params[i])
@@ -378,7 +410,8 @@ def collect_val_files(n_per_subject=24):
 # ---------------------------------------------------------------------------
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--ckpt', required=True, help='Path to 6-DoF model checkpoint.')
+    parser.add_argument('--ckpt', required=True, nargs='+',
+                        help='Checkpoint path(s); pass several to ensemble (mean of predicted params).')
     parser.add_argument('--out-dir', default=None, help='Where to save metrics CSV.')
     parser.add_argument('--limit', type=int, default=None, help='Limit number of scans (debug).')
     parser.add_argument('--mode', choices=['pure', 'hybrid', 'both'], default='both',
@@ -387,35 +420,52 @@ def main():
                         help="Must match the backbone used during training of the checkpoint.")
     parser.add_argument('--fullscan', action='store_true',
                         help="Feed the whole scan in one pass instead of sliding seq_len windows.")
+    parser.add_argument('--avg-window', action='store_true',
+                        help="Average each transition over all sliding-window positions with "
+                             "bidirectional context instead of reading only the last position.")
+    parser.add_argument('--reverse-tta', action='store_true',
+                        help="Also predict the reversed scan, map back, and average (cancels "
+                             "direction-coherent tz bias).")
     args = parser.parse_args()
     do_pure = args.mode in ('pure', 'both')
     do_hybrid = args.mode in ('hybrid', 'both')
 
-    out_dir = args.out_dir or os.path.dirname(args.ckpt)
+    out_dir = args.out_dir or os.path.dirname(args.ckpt[0])
     os.makedirs(out_dir, exist_ok=True)
-    csv_path = os.path.join(out_dir, f'6dof_eval_per_scan_{args.mode}.csv')
+    tag = args.mode
+    if args.fullscan:        tag += '_fullscan'
+    if args.avg_window:      tag += '_avgwin'
+    if args.reverse_tta:     tag += '_revtta'
+    if len(args.ckpt) > 1:   tag += f'_ens{len(args.ckpt)}'
+    csv_path = os.path.join(out_dir, f'6dof_eval_per_scan_{tag}.csv')
 
     print(f"[{get_time()}] Loading calibration...")
     pixel_to_image_mm, image_mm_to_tool, _ = read_calib_matrices(CALIB_PATH)
     image_points = reference_image_points((IMG_H, IMG_W)).numpy()  # (4, P)
 
-    print(f"[{get_time()}] Loading model from {args.ckpt}... (backbone={args.backbone})")
-    ckpt = torch.load(args.ckpt, map_location=DEVICE)
-    state_dict = ckpt['model_state_dict'] if isinstance(ckpt, dict) and 'model_state_dict' in ckpt else ckpt
-    pool_size = infer_pool_size(state_dict, args.backbone)
-    seq_len = infer_seq_len(state_dict)
-    bidirectional = infer_bidirectional(state_dict)
-    print(f"[{get_time()}] Inferred from ckpt: pool_size={pool_size} seq_len={seq_len} bidirectional={bidirectional}")
-    model = FiMANetMamba6DOF(seq_len=seq_len, pair_encoder=True, pair_strides=PAIR_STRIDES,
-                              backbone=args.backbone, pool_size=pool_size,
-                              bidirectional=bidirectional).to(DEVICE)
-    model.load_state_dict(state_dict)
-    model.eval()
+    models, seq_lens = [], []
+    for ck in args.ckpt:
+        print(f"[{get_time()}] Loading model from {ck}... (backbone={args.backbone})")
+        ckpt = torch.load(ck, map_location=DEVICE)
+        state_dict = ckpt['model_state_dict'] if isinstance(ckpt, dict) and 'model_state_dict' in ckpt else ckpt
+        pool_size = infer_pool_size(state_dict, args.backbone)
+        seq_len = infer_seq_len(state_dict)
+        bidirectional = infer_bidirectional(state_dict)
+        print(f"[{get_time()}] Inferred from ckpt: pool_size={pool_size} seq_len={seq_len} bidirectional={bidirectional}")
+        model = FiMANetMamba6DOF(seq_len=seq_len, pair_encoder=True, pair_strides=PAIR_STRIDES,
+                                  backbone=args.backbone, pool_size=pool_size,
+                                  bidirectional=bidirectional).to(DEVICE)
+        model.load_state_dict(state_dict)
+        model.eval()
+        models.append(model)
+        seq_lens.append(seq_len)
 
     val_files = collect_val_files()
     if args.limit:
         val_files = val_files[:args.limit]
-    print(f"[{get_time()}] Eval set: {len(val_files)} scans | inference={'FULL-SCAN' if args.fullscan else 'sliding-window'}")
+    print(f"[{get_time()}] Eval set: {len(val_files)} scans | "
+          f"inference={'FULL-SCAN' if args.fullscan else 'sliding-window'} | "
+          f"avg_window={args.avg_window} reverse_tta={args.reverse_tta} ensemble={len(models)}")
 
     metrics = {
         'pure':   {'gpe': [], 'gle': [], 'lpe': [], 'lle': []},
@@ -435,7 +485,8 @@ def main():
 
         # Model inference once
         pure_global, pure_local, pure_local_params = predict_global_local_matrices(
-            model, frames, image_mm_to_tool, seq_len, fullscan=args.fullscan)
+            models, frames, seq_lens, fullscan=args.fullscan,
+            avg_window=args.avg_window, reverse_tta=args.reverse_tta)
 
         # GT once
         gt_local  = tforms_to_local_image_mm(tforms, image_mm_to_tool)
