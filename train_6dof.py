@@ -20,19 +20,21 @@ from models.fimanet_mamba_6dof import FiMANetMamba6DOF
 # CONFIG
 # =============================================================================
 DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-# Faithful FiMoNet recipe: variable-length windows + random interval, batch 1 + grad accum, full-scan.
-SEQ_LEN_MIN, SEQ_LEN_MAX = 60, 180
-SEQ_LEN = SEQ_LEN_MAX                 # PE buffer + val window length
-FRAME_INTERVALS = (1, 2, 3)           # random temporal subsampling
-BATCH_SIZE = 1                        # variable lengths -> batch 1
-GRAD_ACCUM = 12                       # effective batch ~12
-WINDOW_STRIDE = 16
-EPOCHS = 15            # best ckpt saved each epoch — stop early once GPEproxy flattens
-WARMUP_EPOCHS = 4
+# Tier-1 fine-tune: warm-start bidir at a longer FIXED window (more global/Pearson context; fixed len -> batch >1).
+SEQ_LEN_MIN, SEQ_LEN_MAX = 120, 120
+SEQ_LEN = SEQ_LEN_MAX                 # PE buffer + val/proxy window length
+FRAME_INTERVALS = (1,)                # stride-1 only for the fine-tune
+BATCH_SIZE = 6                        # 6 x 120 = 720 frames (same footprint as bidir 12 x 60)
+GRAD_ACCUM = 2                        # effective batch 12 (matches bidir)
+WINDOW_STRIDE = 8
+EPOCHS = 8
+WARMUP_EPOCHS = 0                     # warm-start: no freeze
+LR_BACKBONE = 1e-5
+LR_HEAD = 3e-5                        # below 1e-4 default for warm-start stability
 PAIR_STRIDES = (1,)
 BACKBONE = os.environ.get("BACKBONE", "resnet18")  # resnet18 | resnet34 | resnet50
 
-# Loss terms (weight 0 to ablate). point-L1 alone never penalized the coherent tz drift.
+# weight 0 to ablate; point-L1 alone ignores the coherent tz drift.
 LOSS_START_POS = 5
 W_GLOBAL  = 0.2   # global-accumulation corner consistency
 W_PEARSON = 0.5   # case-wise Pearson on 6-DoF trajectory (FiMoNet)
@@ -42,13 +44,11 @@ BIDIRECTIONAL = True
 ZREVERSE_P = 0.12     # frame-reversal aug; targets recomputed from reversed poses
 GPE_PROXY_SCANS = 6   # full val scans for the per-epoch GPE proxy
 
-# Loss is point-based (corner-displacement L1 in mm) — no rotation weight needed because
-# the projection automatically balances rotation and translation by their effect on pixels.
+# Point-based loss (corner-displacement L1, mm): projection balances rotation vs translation, no rot weight.
 IMG_H, IMG_W = 480, 640
-CORNER_DENSITY = 4  # 4x4 = 16 points (matches TUS-REC baseline)
+CORNER_DENSITY = 4  # 4x4 = 16 points (TUS-REC baseline)
 
-# Network input: half-res 240x320 (matches FiMoNet's 50% resize). GT corners/calibration
-# stay in 480x640; only the input is resized. eval_6dof INFER_H/INFER_W must match.
+# Network input: half-res (FiMoNet 50% resize); GT/calib stay 480x640. eval_6dof INFER_H/W must match.
 NET_H, NET_W = 240, 320
 
 BASE_DATA_DIR = "/home/123ghdh/datasets"
@@ -66,7 +66,7 @@ def get_time():
 
 
 def _seed_worker(worker_id):
-    # Per-worker numpy seed so random window length/interval differ across workers.
+    # per-worker seed so augmentation differs across workers
     np.random.seed((torch.initial_seed() + worker_id) % (2 ** 32))
 
 
@@ -126,9 +126,7 @@ def collect_val_files_stratified(n_per_subject=24):
 # DIFFERENTIABLE GEOMETRY (torch — used in the loss)
 # =============================================================================
 def euler_zyx_to_matrix(euler):
-    """euler: (..., 3) — (rz, ry, rx). Returns (..., 3, 3) rotation matrix.
-    Matches pytorch3d.transforms.euler_angles_to_matrix(euler, 'ZYX'): R = Rz @ Ry @ Rx.
-    Differentiable; runs on whichever device the input tensor lives on."""
+    """(..., 3) (rz,ry,rx) -> (..., 3,3). R = Rz@Ry@Rx, matches pytorch3d euler 'ZYX'. Differentiable."""
     rz, ry, rx = euler.unbind(-1)
     cz, sz = torch.cos(rz), torch.sin(rz)
     cy, sy = torch.cos(ry), torch.sin(ry)
@@ -155,9 +153,7 @@ def euler_zyx_to_matrix(euler):
 
 
 def params_to_corner_points(params, image_points_mm):
-    """params: (..., 6) — (rz, ry, rx, tx, ty, tz) in image_mm coords.
-    image_points_mm: (4, P) homogeneous corner points in image_mm.
-    Returns (..., 3, P) transformed corner points (xyz only)."""
+    """(..., 6) params + (4, P) image_mm corners -> (..., 3, P) transformed corners (xyz)."""
     R = euler_zyx_to_matrix(params[..., :3])    # (..., 3, 3)
     t = params[..., 3:]                          # (..., 3)
     batch_shape = t.shape[:-1]
@@ -193,8 +189,7 @@ def accumulate_global_torch(local_T):
 
 
 def reference_image_points(image_size=(IMG_H, IMG_W), density=CORNER_DENSITY):
-    """Returns (4, density*density) corner points in pixel coords, homogeneous.
-    Matches the TUS-REC baseline's reference_image_points exactly."""
+    """(4, density^2) homogeneous corner points in pixel coords (matches TUS-REC baseline)."""
     pts = torch.flip(torch.cartesian_prod(
         torch.linspace(1, image_size[0], density),
         torch.linspace(1, image_size[1], density),
@@ -211,10 +206,8 @@ def reference_image_points(image_size=(IMG_H, IMG_W), density=CORNER_DENSITY):
 # TARGET COMPUTATION
 # =============================================================================
 def tforms_to_target_points(tforms, image_mm_to_tool, image_points_mm):
-    """tforms: (N+1, 4, 4) tool-to-world.
-    image_points_mm: (4, P) homogeneous corner points in image_mm (numpy).
-    Returns: (N, 3, P) GT corner points after applying the local image_mm transform
-    (frame_{i+1} -> frame_i) for each consecutive frame pair."""
+    """(N+1,4,4) tool-to-world + (4,P) corners -> (N,3,P) GT corners under each local
+    image_mm transform (frame_{i+1} -> frame_i)."""
     tool_to_image_mm = np.linalg.inv(image_mm_to_tool)
     tforms_inv = np.linalg.inv(tforms)
     N = len(tforms) - 1
@@ -228,24 +221,16 @@ def tforms_to_target_points(tforms, image_mm_to_tool, image_points_mm):
 
 
 def tforms_to_6dof_params(tforms, image_mm_to_tool):
-    """Convert a sequence of tool-to-world transformations into per-pair 6-DoF parameters
-    in image_mm coordinates, matching the TUS-REC2024 baseline's 'parameter' label.
-
-    tforms: np.ndarray shape (N+1, 4, 4) — tool-to-world for N+1 consecutive frames.
-    image_mm_to_tool: np.ndarray shape (4, 4).
-    Returns: np.ndarray shape (N, 6) — (rz, ry, rx, tx, ty, tz) per pair.
-    """
+    """(N+1,4,4) tool-to-world -> (N,6) per-pair (rz,ry,rx,tx,ty,tz) in image_mm
+    (TUS-REC 'parameter' label)."""
     tool_to_image_mm = np.linalg.inv(image_mm_to_tool)
     tforms_inv = np.linalg.inv(tforms)  # world-to-tool per frame
 
     N = len(tforms) - 1
     out = np.zeros((N, 6), dtype=np.float32)
     for i in range(N):
-        # tool_{i+1} -> tool_i  =  T(world->tool_i) @ T(tool_{i+1}->world)
-        t_tool_pair = tforms_inv[i] @ tforms[i + 1]
-        # convert to image_mm frame: image_mm_{i+1} -> image_mm_i
-        t_imm = tool_to_image_mm @ t_tool_pair @ image_mm_to_tool
-        # 'ZYX' euler — matches pytorch3d matrix_to_euler_angles('ZYX') ordering: (rz, ry, rx)
+        t_tool_pair = tforms_inv[i] @ tforms[i + 1]               # tool_{i+1} -> tool_i
+        t_imm = tool_to_image_mm @ t_tool_pair @ image_mm_to_tool  # -> image_mm frame
         rz, ry, rx = Rotation.from_matrix(t_imm[:3, :3]).as_euler('ZYX')
         tx, ty, tz = t_imm[:3, 3]
         out[i] = (rz, ry, rx, tx, ty, tz)
@@ -285,7 +270,8 @@ def _np_tforms_to_global(tforms, image_mm_to_tool):
 
 
 def _predict_local_params_np(model, frames):
-    """Full-scan inference: whole scan in one pass -> (N-1, 6) (matches eval --fullscan)."""
+    """Sliding-window avg-window inference, mirroring eval_6dof --avg-window (each transition
+    averaged over window positions with >=5 future frames). Must match eval or selection drifts."""
     N = len(frames)
     resized = np.zeros((N, 1, NET_H, NET_W), dtype=np.float32)
     for i in range(N):
@@ -293,12 +279,43 @@ def _predict_local_params_np(model, frames):
         if img.max() > 1.0:
             img = img / 255.0
         resized[i, 0] = img.astype(np.float32)
+    sl = SEQ_LEN
     model.eval()
+    if N <= sl:
+        with torch.no_grad(), autocast(device_type='cuda', dtype=torch.float16):
+            out = model(torch.from_numpy(resized).unsqueeze(0).to(DEVICE))
+        return out[0].float().cpu().numpy()
+
+    starts = list(range(0, N - sl + 1))
+    outs = np.zeros((len(starts), sl - 1, 6), dtype=np.float32)
     with torch.no_grad():
-        seq = torch.from_numpy(resized).unsqueeze(0).to(DEVICE)  # [1, N, 1, H, W]
-        with autocast(device_type='cuda', dtype=torch.float16):
-            out = model(seq)
-    return out[0].float().cpu().numpy()  # (N-1, 6)
+        for c in range(0, len(starts), 4):
+            chunk = starts[c:c + 4]
+            batch = torch.from_numpy(np.stack([resized[s:s + sl] for s in chunk])).to(DEVICE)
+            with autocast(device_type='cuda', dtype=torch.float16):
+                outs[c:c + len(chunk)] = model(batch).float().cpu().numpy()
+
+    params = np.zeros((N - 1, 6), dtype=np.float32)
+    p_hi = sl - 7  # last position with >=5 future frames inside the window
+    sum_mid = np.zeros((N - 1, 6)); cnt_mid = np.zeros(N - 1, dtype=np.int64)
+    sum_any = np.zeros((N - 1, 6)); cnt_any = np.zeros(N - 1, dtype=np.int64)
+    fallback = outs[0][min(LOSS_START_POS, sl - 2)]
+    for w, s in enumerate(starts):
+        for p in range(LOSS_START_POS, sl - 1):
+            t = s + p
+            if t >= N - 1:
+                break
+            sum_any[t] += outs[w][p]; cnt_any[t] += 1
+            if p <= p_hi:
+                sum_mid[t] += outs[w][p]; cnt_mid[t] += 1
+    for t in range(N - 1):
+        if cnt_mid[t]:
+            params[t] = sum_mid[t] / cnt_mid[t]
+        elif cnt_any[t]:
+            params[t] = sum_any[t] / cnt_any[t]
+        else:
+            params[t] = fallback
+    return params
 
 
 def compute_gpe_proxy(model, proxy_scans, image_mm_to_tool, image_points_mm):
@@ -327,21 +344,17 @@ def compute_gpe_proxy(model, proxy_scans, image_mm_to_tool, image_points_mm):
 # LOSS
 # =============================================================================
 class PointBasedLoss(nn.Module):
-    """Per-pair corner L1 + global-accumulation consistency + case-wise Pearson on the
-    6-DoF trajectory (FiMoNet). The latter two penalize coherent tz drift that per-pair L1
-    tolerates. Set w_global/w_pearson=0 for the original pure point loss."""
+    """Per-pair corner L1 + global-accumulation consistency + case-wise Pearson (FiMoNet).
+    The latter two penalize coherent tz drift; set w_global/w_pearson=0 for pure point loss."""
     def __init__(self, image_points_mm, start_pos=LOSS_START_POS, w_global=W_GLOBAL, w_pearson=W_PEARSON):
         super().__init__()
-        # image_points_mm: (4, P) homogeneous; pre-compute once.
-        self.register_buffer('image_points_mm', image_points_mm)
+        self.register_buffer('image_points_mm', image_points_mm)  # (4, P) homogeneous
         self.start_pos = start_pos
         self.w_global = w_global
         self.w_pearson = w_pearson
 
     def forward(self, pred_params, target_points, target_params=None):
-        # pred_params:   [B, L, 6]
-        # target_points: [B, L+, 3, P]  (sliced to L below)
-        # target_params: [B, L+, 6]     (GT 6-DoF; required for global/pearson terms)
+        # pred_params [B,L,6]; target_points [B,L+,3,P]; target_params [B,L+,6] (GT, for global/pearson)
         L = pred_params.shape[1]
         target = target_points[:, :L, :, :]
         pred   = params_to_corner_points(pred_params, self.image_points_mm)  # [B, L, 3, P]
@@ -352,7 +365,7 @@ class PointBasedLoss(nn.Module):
 
         tgt_p = target_params[:, :L, :]
         loss = local_loss
-        # fp32 for the accumulation chain (fp16 drifts over 19 matmuls).
+        # fp32 for the accumulation chain (fp16 drifts over the long matmul chain).
         with torch.autocast(device_type='cuda', enabled=False):
             if self.w_global > 0:
                 pts = self.image_points_mm.float()                                  # (4, P)
@@ -368,7 +381,7 @@ class PointBasedLoss(nn.Module):
 
     @staticmethod
     def _pearson(pred, gt, eps=1e-6):
-        # pred, gt: [B, L', 6]. Correlation across the time axis, per DoF, per sample.
+        # pred, gt [B,L',6]; correlation across time, per DoF per sample
         pred = pred.float(); gt = gt.float()
         pred = pred - pred.mean(dim=1, keepdim=True)
         gt   = gt   - gt.mean(dim=1, keepdim=True)
@@ -402,7 +415,7 @@ class LargeUSDataset6DOF(Dataset):
                         n = f['frames'].shape[0]
                         if n < SEQ_LEN_MIN + 2:
                             continue
-                        # leave room for at least SEQ_LEN_MIN frames at interval 1
+                        # leave room for SEQ_LEN_MIN frames
                         for i in range(0, n - SEQ_LEN_MIN, WINDOW_STRIDE):
                             self.samples.append({'path': fp, 'start': i, 'n': n})
                 except Exception as e:
@@ -416,9 +429,7 @@ class LargeUSDataset6DOF(Dataset):
 
     @staticmethod
     def _augment_intensity(seq):
-        """Intensity-only augmentation. NO hflip (it would invalidate 6-DoF targets).
-        Conservative — gamma + stronger speckle were dropped after the R34 attempt
-        plateaued (see thesis Section X: failed-experiment write-up)."""
+        """Intensity-only aug (gamma/bias + light speckle). No hflip — it invalidates 6-DoF targets."""
         if np.random.rand() < 0.5:
             g = np.random.uniform(0.9, 1.1)
             b = np.random.uniform(-0.05, 0.05)
@@ -431,7 +442,7 @@ class LargeUSDataset6DOF(Dataset):
     def __getitem__(self, idx):
         m = self.samples[idx]
         start, n = m['start'], m['n']
-        # Random window length + interval (FiMoNet aug); fall back to interval 1 near the end.
+        # sample window length + interval; clamp to interval 1 near the scan end
         s = int(np.random.choice(FRAME_INTERVALS))
         L = int(np.random.randint(SEQ_LEN_MIN, SEQ_LEN_MAX + 1))
         if start + L * s > n - 1:
@@ -441,14 +452,14 @@ class LargeUSDataset6DOF(Dataset):
             frames = f['frames'][start:start + L * s:s][:L]
             tforms = f['tforms'][start:start + L * s + 1:s][:L + 1].astype(np.float32)
 
-        # Z-reverse aug: reverse frame order; targets recomputed from reversed poses.
+        # z-reverse aug: reverse frames, recompute targets from reversed poses
         if self.augment and np.random.rand() < ZREVERSE_P:
             frames = frames[::-1].copy()
             tforms = np.concatenate([tforms[:L][::-1], tforms[:1]], axis=0).copy()  # L+1 poses
 
         seq = []
         for i in range(L):
-            img = cv2.resize(frames[i], (NET_W, NET_H))  # half-res, preserves speckle + aspect
+            img = cv2.resize(frames[i], (NET_W, NET_H))  # half-res
             if img.max() > 1.0:
                 img = img / 255.0
             seq.append(np.expand_dims(img, axis=0).astype(np.float32))
@@ -482,7 +493,7 @@ class MemoryUSDataset6DOF(Dataset):
         seq = []
         for i in range(self.seq_len):
             img = self.f[start + i]
-            img = cv2.resize(img, (NET_W, NET_H))  # native 480x640
+            img = cv2.resize(img, (NET_W, NET_H))  # half-res, matches training
             if img.max() > 1.0:
                 img = img / 255.0
             seq.append(np.expand_dims(img, axis=0))
@@ -525,10 +536,10 @@ def train_model(run_name, run_dir, model, train_loader, val_loader, epochs, imag
         head_params += list(model.pair_proj.parameters())
 
     optimizer = torch.optim.Adam([
-        {'params': backbone_params, 'lr': 1e-5},
-        {'params': head_params, 'lr': 1e-4},
+        {'params': backbone_params, 'lr': LR_BACKBONE},
+        {'params': head_params, 'lr': LR_HEAD},
     ], weight_decay=1e-5)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=3)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=2)
     criterion = PointBasedLoss(image_points_mm_torch, start_pos=5).to(DEVICE)
     scaler = GradScaler('cuda')
 
@@ -550,7 +561,7 @@ def train_model(run_name, run_dir, model, train_loader, val_loader, epochs, imag
             target_pts = target_pts.to(DEVICE, non_blocking=True)
             target_prm = target_prm.to(DEVICE, non_blocking=True)
             with autocast(device_type='cuda', dtype=torch.float16):
-                outputs = model(seqs)             # [1, L, 6]
+                outputs = model(seqs)             # [B, L, 6]
                 loss    = criterion(outputs, target_pts, target_prm)  # point + global + pearson
             scaler.scale(loss / GRAD_ACCUM).backward()
             if (i + 1) % GRAD_ACCUM == 0:
@@ -562,7 +573,7 @@ def train_model(run_name, run_dir, model, train_loader, val_loader, epochs, imag
             train_loss += loss.item()
             if i % 500 == 0:
                 print(f"[{get_time()}] Ep {epoch+1} | Batch {i}/{total_batches} | Loss: {loss.item():.4f} mm")
-        # flush any remaining accumulated gradients
+        # flush remaining grads
         if (i + 1) % GRAD_ACCUM != 0:
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
@@ -572,7 +583,7 @@ def train_model(run_name, run_dir, model, train_loader, val_loader, epochs, imag
 
         avg_train = train_loss / max(total_batches, 1)
 
-        # Validation: same point-based loss + max-corner-error sanity metric
+        # validation: point loss + max-corner sanity metric
         model.eval()
         val_loss = 0.0
         val_max_err = 0.0
@@ -584,20 +595,19 @@ def train_model(run_name, run_dir, model, train_loader, val_loader, epochs, imag
                 with autocast(device_type='cuda', dtype=torch.float16):
                     outputs = model(seqs)
                     v_loss  = criterion(outputs, target_pts, target_prm)
-                    # Sanity metric: last-position max corner displacement error in mm
+                    # sanity: last-position max corner error (mm)
                     pred_pts = params_to_corner_points(outputs[:, -1, :], criterion.image_points_mm)  # [B, 3, P]
                     last_pos = outputs.shape[1] - 1
                     gt_pts = target_pts[:, last_pos, :, :]
                     per_corner = torch.linalg.norm(pred_pts - gt_pts, dim=1)  # [B, P]
-                    max_err = per_corner.max(dim=1).values.mean()             # avg across batch of per-scan max
+                    max_err = per_corner.max(dim=1).values.mean()             # mean over batch of per-scan max
                 val_loss   += v_loss.item()
                 val_max_err += max_err.item()
 
         avg_val     = val_loss / len(val_loader)
         avg_max_err = val_max_err / len(val_loader)
 
-        # Select checkpoint + step scheduler on the GPE proxy (per-pair val loss is
-        # decoupled from GPE). tz_resid tracks the sign bias.
+        # select + step scheduler on the GPE proxy (val loss is decoupled from GPE); tz_resid tracks sign bias
         gpe_proxy, tz_resid = (float('nan'), float('nan'))
         if proxy_scans:
             gpe_proxy, tz_resid = compute_gpe_proxy(model, proxy_scans, image_mm_to_tool, image_points_mm_np)
@@ -613,7 +623,7 @@ def train_model(run_name, run_dir, model, train_loader, val_loader, epochs, imag
             torch.save(model.state_dict(), best_path)
             tag = f"GPEproxy {gpe_proxy:.2f} mm" if proxy_scans and not np.isnan(gpe_proxy) else f"val loss {avg_val:.4f}"
             print(f"[{get_time()}] Best saved: {best_path} ({tag}).")
-        # Also save per-epoch in case a different selection is preferred later
+        # per-epoch ckpt for alternate selection / ensembling
         ep_path = os.path.join(run_dir, f"{run_name}_ep{epoch+1}.pth")
         torch.save(model.state_dict(), ep_path)
 
@@ -625,14 +635,15 @@ def train_model(run_name, run_dir, model, train_loader, val_loader, epochs, imag
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='FiMA-Net 6-DoF training')
     parser.add_argument('--name', '-n', default='fima_pair_mamba_6dof', help='Run name base tag.')
+    parser.add_argument('--init-ckpt', default=None, help='Warm-start weights (e.g. the bidir best ckpt).')
     args = parser.parse_args()
 
     pixel_to_image_mm, image_mm_to_tool = read_calib_matrices(CALIB_PATH)
     print(f"[{get_time()}] Loaded calib from {CALIB_PATH}")
 
-    # Reference corner points (4 corners of 480x640 image) in image_mm.
-    image_points_pixel = reference_image_points((IMG_H, IMG_W), CORNER_DENSITY).numpy()  # (4, P) numpy
-    image_points_mm    = pixel_to_image_mm @ image_points_pixel                          # (4, P) numpy
+    # reference corner grid (CORNER_DENSITY^2 points) in image_mm
+    image_points_pixel = reference_image_points((IMG_H, IMG_W), CORNER_DENSITY).numpy()  # (4, P)
+    image_points_mm    = pixel_to_image_mm @ image_points_pixel                          # (4, P)
     image_points_mm_torch = torch.tensor(image_points_mm, dtype=torch.float32)
     print(f"[{get_time()}] Corner reference: {image_points_mm.shape[1]} points in image_mm")
 
@@ -651,15 +662,15 @@ if __name__ == '__main__':
     val_pairs = collect_val_files_stratified(VAL_PER_SUBJECT)
     n_subj = len({c.split('/')[0] for _, _, c in val_pairs})
     print(f"[{get_time()}] Validation set: {len(val_pairs)} cases across {n_subj} subject(s)")
-    # Val uses a fixed window length (secondary log metric; selection is the GPE proxy).
+    # val window = secondary log metric; selection is the GPE proxy
     val_datasets = [MemoryUSDataset6DOF(fp, tp, seq_len=SEQ_LEN_MIN,
                                          image_mm_to_tool=image_mm_to_tool,
                                          image_points_mm=image_points_mm)
                     for fp, tp, _ in val_pairs]
     val_ds = ConcatDataset(val_datasets)
-    val_loader = DataLoader(val_ds, batch_size=12, shuffle=False, num_workers=2, pin_memory=True)
+    val_loader = DataLoader(val_ds, batch_size=6, shuffle=False, num_workers=2, pin_memory=True)
 
-    # Full-scan val subset for the per-epoch GPE proxy.
+    # full val scans for the per-epoch GPE proxy
     proxy_scans = []
     seen_bases = []
     for fp, tp, cid in val_pairs:
@@ -681,13 +692,19 @@ if __name__ == '__main__':
     model = FiMANetMamba6DOF(seq_len=SEQ_LEN_MAX, pair_encoder=True, pair_strides=PAIR_STRIDES,
                               backbone=BACKBONE, pool_size=POOL_SIZE, freeze_early=FREEZE_EARLY,
                               bidirectional=BIDIRECTIONAL)
+    if args.init_ckpt:
+        sd = torch.load(args.init_ckpt, map_location='cpu')
+        sd = sd['model_state_dict'] if isinstance(sd, dict) and 'model_state_dict' in sd else sd
+        sd.pop('pos_encoder.pe', None)  # length-dependent buffer; model rebuilds it for SEQ_LEN
+        missing, unexpected = model.load_state_dict(sd, strict=False)
+        print(f"[{get_time()}] Warm-start from {args.init_ckpt} | missing={missing} unexpected={unexpected}")
     n_params = sum(p.numel() for p in model.parameters())
     n_train = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"[{get_time()}] Total params: {n_params/1e6:.1f}M ({n_train/1e6:.1f}M trainable) | "
           f"seq={SEQ_LEN_MIN}-{SEQ_LEN_MAX} interval={FRAME_INTERVALS} stride={WINDOW_STRIDE} "
           f"batch={BATCH_SIZE}x{GRAD_ACCUM}accum bidir={BIDIRECTIONAL} pool={POOL_SIZE}x{POOL_SIZE} "
           f"freeze_early={FREEZE_EARLY} | loss: point + {W_GLOBAL}*global + {W_PEARSON}*pearson | "
-          f"zrev_p={ZREVERSE_P} | full-scan proxy")
+          f"zrev_p={ZREVERSE_P} | sliding avg-window proxy")
     best_path = train_model(run_name, run_dir, model, train_loader, val_loader, EPOCHS,
                             image_points_mm_torch,
                             proxy_scans=proxy_scans, image_mm_to_tool=image_mm_to_tool,
