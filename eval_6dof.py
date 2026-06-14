@@ -186,7 +186,7 @@ def cal_dist(label, pred, mode='all'):
 # Model inference
 # ---------------------------------------------------------------------------
 LOSS_START_POS = 5   # positions below this were masked from the training loss
-WINDOW_BATCH = 16    # sliding windows per forward pass
+WINDOW_FRAME_CAP = 960  # frames per forward pass; window batch = cap // seq_len (avoids OOM at long windows)
 
 
 def _resize_frames(frames):
@@ -210,9 +210,10 @@ def predict_local_params(model, resized, seq_len=SEQ_LEN, avg_window=False):
     params = np.zeros((N - 1, 6), dtype=np.float32)
     starts = list(range(0, N - seq_len + 1))
     outs = np.zeros((len(starts), seq_len - 1, 6), dtype=np.float32)
+    wb = max(1, WINDOW_FRAME_CAP // seq_len)
     with torch.no_grad():
-        for c in range(0, len(starts), WINDOW_BATCH):
-            chunk = starts[c:c + WINDOW_BATCH]
+        for c in range(0, len(starts), wb):
+            chunk = starts[c:c + wb]
             batch = torch.from_numpy(np.stack([resized[s:s + seq_len] for s in chunk])).to(DEVICE)
             outs[c:c + len(chunk)] = model(batch).float().cpu().numpy()
 
