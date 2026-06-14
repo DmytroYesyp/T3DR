@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torchvision.models as models
 import math
 from mamba_ssm import Mamba
@@ -42,6 +43,35 @@ class BiMamba(nn.Module):
         return self.fwd(x) + self.bwd(x.flip(1)).flip(1)
 
 
+class CorrEncoder(nn.Module):
+    """Local correlation volume between adjacent-frame feature maps -> motion vector.
+    For each cell, cosine-correlates against a (2d+1)^2 neighbourhood in the next frame:
+    the correlation magnitude encodes inter-frame speckle decorrelation (the out-of-plane
+    cue that global pooling erases); the peak location encodes in-plane shift."""
+    def __init__(self, max_disp=4, out_dim=128):
+        super().__init__()
+        self.d = max_disp
+        nd = (2 * max_disp + 1) ** 2
+        self.enc = nn.Sequential(
+            nn.Conv2d(nd, 96, 3, padding=1), nn.ReLU(inplace=True),
+            nn.Conv2d(96, 96, 3, stride=2, padding=1), nn.ReLU(inplace=True),
+            nn.AdaptiveAvgPool2d(4),
+        )
+        self.proj = nn.Sequential(nn.Linear(96 * 16, out_dim), nn.LayerNorm(out_dim), nn.ReLU(inplace=True))
+
+    def forward(self, fa, fb):
+        # fa, fb: [N, C, H, W] — feature maps of frame i and i+1
+        fa = F.normalize(fa, dim=1)
+        fb = F.normalize(fb, dim=1)
+        H, W = fa.shape[-2:]
+        d = self.d
+        fb_pad = F.pad(fb, [d, d, d, d])
+        corrs = [(fa * fb_pad[:, :, dy:dy + H, dx:dx + W]).sum(1, keepdim=True)
+                 for dy in range(2 * d + 1) for dx in range(2 * d + 1)]
+        cv = torch.cat(corrs, dim=1)  # [N, (2d+1)^2, H, W]
+        return self.proj(self.enc(cv).flatten(1))  # [N, out_dim]
+
+
 class FiMANetMamba6DOF(nn.Module):
     """6-DoF variant of FiMANetMamba.
 
@@ -54,7 +84,8 @@ class FiMANetMamba6DOF(nn.Module):
     def __init__(self, seq_len=20, hidden_size=256, num_layers=2,
                  pair_encoder=True, pair_strides=(1,),
                  mamba_d_state=16, mamba_d_conv=4, mamba_expand=2,
-                 backbone='resnet18', pool_size=2, freeze_early=True, bidirectional=False):
+                 backbone='resnet18', pool_size=2, freeze_early=True, bidirectional=False,
+                 use_corr=False, corr_disp=4, corr_dim=128):
         super().__init__()
         self.seq_len = seq_len
         self.pair_encoder = pair_encoder
@@ -108,8 +139,16 @@ class FiMANetMamba6DOF(nn.Module):
             nn.Dropout(0.3),
         )
 
+        # Tier-2: adjacent-frame correlation volume on the layer2 maps (ch2), fused into the
+        # pair encoder. use_corr=False keeps the old architecture so prior checkpoints load.
+        self.use_corr = use_corr
+        if use_corr:
+            self.corr_encoder = CorrEncoder(max_disp=corr_disp, out_dim=corr_dim)
+
         if pair_encoder:
             in_dim = hidden_size * (1 + len(self.pair_strides))
+            if use_corr:
+                in_dim += corr_dim
             self.pair_proj = nn.Sequential(
                 nn.Linear(in_dim, hidden_size),
                 nn.LayerNorm(hidden_size),
@@ -153,6 +192,12 @@ class FiMANetMamba6DOF(nn.Module):
             parts = [f_curr]
             for stride in self.pair_strides:
                 parts.append(features[:, stride:stride + L, :] - f_curr)
+            if self.use_corr:
+                C2, Hf, Wf = f2.shape[1], f2.shape[2], f2.shape[3]
+                f2_seq = f2.view(b, s, C2, Hf, Wf)
+                fa = f2_seq[:, :L].reshape(b * L, C2, Hf, Wf)        # frames 0..L-1
+                fb = f2_seq[:, 1:1 + L].reshape(b * L, C2, Hf, Wf)   # frames 1..L (adjacent)
+                parts.append(self.corr_encoder(fa, fb).view(b, L, -1))
             features = self.pair_proj(torch.cat(parts, dim=-1))
 
         features = self.pos_encoder(features)

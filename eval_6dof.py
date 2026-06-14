@@ -101,6 +101,16 @@ def infer_bidirectional(state_dict):
     return any('temporal_layers' in k and '.fwd.' in k for k in state_dict)
 
 
+def infer_corr(state_dict):
+    """Recover the Tier-2 correlation encoder from the checkpoint -> (use_corr, disp, dim)."""
+    w_enc = state_dict.get('corr_encoder.enc.0.weight')   # [96, (2d+1)^2, 3, 3]
+    w_proj = state_dict.get('corr_encoder.proj.0.weight')  # [out_dim, 96*16]
+    if w_enc is None or w_proj is None:
+        return False, 4, 128
+    disp = (int(round(w_enc.shape[1] ** 0.5)) - 1) // 2
+    return True, disp, int(w_proj.shape[0])
+
+
 def params_to_matrix(params):
     """params: (6,) array (rz, ry, rx, tx, ty, tz). Returns (4, 4) image_mm transform."""
     rz, ry, rx, tx, ty, tz = params
@@ -452,10 +462,13 @@ def main():
         pool_size = infer_pool_size(state_dict, args.backbone)
         seq_len = infer_seq_len(state_dict)
         bidirectional = infer_bidirectional(state_dict)
-        print(f"[{get_time()}] Inferred from ckpt: pool_size={pool_size} seq_len={seq_len} bidirectional={bidirectional}")
+        use_corr, corr_disp, corr_dim = infer_corr(state_dict)
+        print(f"[{get_time()}] Inferred from ckpt: pool_size={pool_size} seq_len={seq_len} "
+              f"bidirectional={bidirectional} use_corr={use_corr}(d{corr_disp})")
         model = FiMANetMamba6DOF(seq_len=seq_len, pair_encoder=True, pair_strides=PAIR_STRIDES,
                                   backbone=args.backbone, pool_size=pool_size,
-                                  bidirectional=bidirectional).to(DEVICE)
+                                  bidirectional=bidirectional, use_corr=use_corr,
+                                  corr_disp=corr_disp, corr_dim=corr_dim).to(DEVICE)
         model.load_state_dict(state_dict)
         model.eval()
         models.append(model)
