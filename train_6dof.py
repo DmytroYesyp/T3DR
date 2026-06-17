@@ -16,9 +16,7 @@ from scipy.spatial.transform import Rotation
 
 from models.fimanet_mamba_6dof import FiMANetMamba6DOF
 
-# =============================================================================
-# CONFIG
-# =============================================================================
+# --- CONFIG ---
 DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 # Tier-2: warm-start bidir + add an adjacent-frame correlation volume (speckle/out-of-plane cue).
 # Backbone frozen for WARMUP_EPOCHS so the new corr + pair_proj learn before the backbone moves.
@@ -62,9 +60,7 @@ VAL_TFORMS_ROOT = os.path.join(BASE_DATA_DIR, 'valDataset/data/transfs')
 CALIB_PATH      = os.path.join(BASE_DATA_DIR, 'calib_matrix.csv')
 VAL_PER_SUBJECT = 24
 
-# =============================================================================
-# UTILITIES
-# =============================================================================
+# --- UTILITIES ---
 def get_time():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -126,9 +122,7 @@ def collect_val_files_stratified(n_per_subject=24):
         pairs.extend(subj_pairs[:n_per_subject])
     return pairs
 
-# =============================================================================
-# DIFFERENTIABLE GEOMETRY (torch — used in the loss)
-# =============================================================================
+# --- DIFFERENTIABLE GEOMETRY (torch — used in the loss) ---
 def euler_zyx_to_matrix(euler):
     """(..., 3) (rz,ry,rx) -> (..., 3,3). R = Rz@Ry@Rx, matches pytorch3d euler 'ZYX'. Differentiable."""
     rz, ry, rx = euler.unbind(-1)
@@ -206,9 +200,7 @@ def reference_image_points(image_size=(IMG_H, IMG_W), density=CORNER_DENSITY):
     return pts  # (4, density*density)
 
 
-# =============================================================================
-# TARGET COMPUTATION
-# =============================================================================
+# --- TARGET COMPUTATION ---
 def tforms_to_target_points(tforms, image_mm_to_tool, image_points_mm):
     """(N+1,4,4) tool-to-world + (4,P) corners -> (N,3,P) GT corners under each local
     image_mm transform (frame_{i+1} -> frame_i)."""
@@ -240,9 +232,7 @@ def tforms_to_6dof_params(tforms, image_mm_to_tool):
         out[i] = (rz, ry, rx, tx, ty, tz)
     return out
 
-# =============================================================================
-# GPE PROXY (numpy — mirrors eval_6dof so checkpoint selection tracks real GPE)
-# =============================================================================
+# --- GPE PROXY (numpy — mirrors eval_6dof so checkpoint selection tracks real GPE) ---
 def _np_params_to_matrix(p):
     """(6,) -> (4,4). Mirrors eval_6dof.params_to_matrix."""
     rz, ry, rx, tx, ty, tz = p
@@ -344,9 +334,7 @@ def compute_gpe_proxy(model, proxy_scans, image_mm_to_tool, image_points_mm):
     tz_resid = float(np.mean(tz_resids)) if tz_resids else float('nan')
     return gpe, tz_resid
 
-# =============================================================================
-# LOSS
-# =============================================================================
+# --- LOSS ---
 class PointBasedLoss(nn.Module):
     """Per-pair corner L1 + global-accumulation consistency + case-wise Pearson (FiMoNet).
     The latter two penalize coherent tz drift; set w_global/w_pearson=0 for pure point loss."""
@@ -394,9 +382,7 @@ class PointBasedLoss(nn.Module):
         corr = num / (den + eps)                                     # [B, 6]
         return (1.0 - corr).mean()
 
-# =============================================================================
-# DATASETS
-# =============================================================================
+# --- DATASETS ---
 class LargeUSDataset6DOF(Dataset):
     def __init__(self, root_dirs, seq_len, image_mm_to_tool, image_points_mm, augment=True):
         self.samples = []
@@ -509,9 +495,7 @@ class MemoryUSDataset6DOF(Dataset):
                 torch.tensor(target, dtype=torch.float32),
                 torch.tensor(target_params, dtype=torch.float32))
 
-# =============================================================================
-# TRAINING
-# =============================================================================
+# --- TRAINING ---
 def train_model(run_name, run_dir, model, train_loader, val_loader, epochs, image_points_mm_torch,
                 proxy_scans=None, image_mm_to_tool=None, image_points_mm_np=None):
     print(f"\n{'='*50}")
@@ -635,9 +619,7 @@ def train_model(run_name, run_dir, model, train_loader, val_loader, epochs, imag
 
     return best_path
 
-# =============================================================================
-# MAIN
-# =============================================================================
+# --- MAIN ---
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='FiMA-Net 6-DoF training')
     parser.add_argument('--name', '-n', default='fima_pair_mamba_6dof', help='Run name base tag.')

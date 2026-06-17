@@ -26,8 +26,8 @@ class TemporalSSMBlock(nn.Module):
         self.out_proj = nn.Linear(self.d_inner, d_model)
 
     def forward(self, x):
-        # x: [Batch, Seq, d_model]
-        x_transpose = x.transpose(1, 2) # [B, D, S] для Conv1d
+        # x: [B, S, d_model]
+        x_transpose = x.transpose(1, 2)
         xz = self.in_proj(x)
         x_proj, z = xz.chunk(2, dim=-1)
         x_conv = self.conv1d(x_proj.transpose(1, 2))[..., :x.shape[1]]
@@ -49,8 +49,8 @@ class FiMANet(nn.Module):
         self.predict_sign = predict_sign
         if predict_sign and predict_uncertainty:
             raise ValueError("predict_sign and predict_uncertainty are mutually exclusive")
-        # Pair encoder: [f_curr | Δ_s1 | Δ_s2 | ...] before the temporal stack.
-        # Multi-scale strides capture motion at multiple temporal gaps.
+        # Pair encoder: [f_curr | Δ_s1 | Δ_s2 | ...]; multi-scale strides capture
+        # motion at multiple temporal gaps.
         self.pair_encoder = pair_encoder
         self.pair_strides = tuple(int(s) for s in pair_strides) if pair_encoder else ()
         if pair_encoder:
@@ -68,18 +68,18 @@ class FiMANet(nn.Module):
 
         self.stem = nn.Sequential(base_resnet.conv1, base_resnet.bn1, base_resnet.relu, base_resnet.maxpool)
         self.layer1 = base_resnet.layer1
-        self.layer2 = base_resnet.layer2 # 128
-        self.layer3 = base_resnet.layer3 # 256
-        self.layer4 = base_resnet.layer4 # 512
+        self.layer2 = base_resnet.layer2  # 128
+        self.layer3 = base_resnet.layer3  # 256
+        self.layer4 = base_resnet.layer4  # 512
 
-        # Заморозка
+        # stem + layer1 stay frozen.
         for param in self.stem.parameters(): param.requires_grad = False
         for param in self.layer1.parameters(): param.requires_grad = False
 
-        # Pooling to 2x2 (щоб було 4 патчі на рівень)
+        # Pool each level to 2x2 → 4 patches.
         self.pool = nn.AdaptiveAvgPool2d((2, 2))
 
-        # Fusion: (128+256+512) * 4 патчі = 3584
+        # (128+256+512) * 4 = 3584
         self.fusion = nn.Sequential(
             nn.Linear(3584, hidden_size),
             nn.LayerNorm(hidden_size),

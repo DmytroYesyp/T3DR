@@ -31,7 +31,7 @@ EXPERIMENTS = [
     ("ESKF σ=0.25",              "ablation_eskf_sigma025",      ["--filter", "eskf", "--sigma", "0.25"]),
     ("ESKF σ=0.15",              "ablation_eskf_sigma015",      ["--filter", "eskf", "--sigma", "0.15"]),
     ("ESKF σ=0.10",              "ablation_eskf_sigma010",      ["--filter", "eskf", "--sigma", "0.10"]),
-    # --- ESKF + TTA, using the σ that worked best in prior experimentation; rerun the σ sweep first if needed ---
+    # --- ESKF + TTA at the best σ ---
     ("ESKF σ=0.15 + TTA",        "ablation_eskf_sigma015_tta",  ["--filter", "eskf", "--sigma", "0.15", "--tta"]),
     # --- Complementary filter sweep ---
     ("Complementary α=0.1",      "ablation_comp_a010",          ["--filter", "complementary", "--alpha", "0.1"]),
@@ -196,7 +196,6 @@ def main():
         print("Dry-run — skipping table generation.")
         return
 
-    # Parse summaries and build results
     results = []
     for label, run_name, _ in selected:
         log_path = os.path.join(args.logs_dir, f"{run_name}.txt")
@@ -205,7 +204,6 @@ def main():
 
     write_tables(results, args.logs_dir)
 
-    # Pretty-print summary to stdout
     print()
     print("=" * 110)
     print(f"{'Config':<32} {'Val MAE':>9} {'Val FDR':>9} {'Global MAE':>11} {'Global FDR':>11} {'Valid':>7}")

@@ -2,15 +2,10 @@ import numpy as np
 
 
 class IMUSimulator:
-    """
-    Synthesizes realistic IMU (accelerometer + gyroscope) readings
-    from ground-truth 4x4 transformation matrices.
+    """Synthesizes IMU readings from ground-truth 4x4 transforms.
 
-    On-the-fly augmentation: each call produces different noise so the
-    model learns to handle real sensor variance.
-
-    Accelerometer: specific force in sensor frame (includes gravity).
-    Gyroscope:     angular velocity in sensor frame.
+    Each call adds fresh noise (augmentation). Accelerometer = specific force
+    in sensor frame (includes gravity); gyroscope = angular velocity in sensor frame.
     """
 
     def __init__(self, dt=1 / 30.0,
@@ -20,18 +15,8 @@ class IMUSimulator:
                  gyro_bias_instability=0.005,
                  gravity=9.81,
                  noise_scale_range=(0.5, 2.0)):
-        """
-        Args:
-            dt: time between consecutive frames (seconds)
-            accel_noise_std: white-noise σ for accelerometer (m/s²)
-            gyro_noise_std: white-noise σ for gyroscope (rad/s)
-            accel_bias_instability: random-walk σ for accel bias drift
-            gyro_bias_instability: random-walk σ for gyro bias drift
-            gravity: gravity magnitude; set 0 if positions are in mm
-                     and you don't want a gravity component
-            noise_scale_range: (lo, hi) uniform multiplier applied to
-                               noise each call — acts as augmentation
-        """
+        # gravity: set 0 if positions are in mm and no gravity component is wanted.
+        # noise_scale_range: (lo, hi) uniform noise multiplier per call (augmentation).
         self.dt = dt
         self.accel_noise_std = accel_noise_std
         self.gyro_noise_std = gyro_noise_std
@@ -40,9 +25,6 @@ class IMUSimulator:
         self.gravity_vec = np.array([0.0, 0.0, gravity], dtype=np.float64)
         self.noise_scale_range = noise_scale_range
 
-    # ------------------------------------------------------------------
-    # helpers
-    # ------------------------------------------------------------------
     @staticmethod
     def _rotation_log(R):
         """SO(3) logarithmic map: rotation matrix → rotation vector."""
@@ -55,9 +37,6 @@ class IMUSimulator:
                              R[0, 2] - R[2, 0],
                              R[1, 0] - R[0, 1]])
 
-    # ------------------------------------------------------------------
-    # clean signal derivation
-    # ------------------------------------------------------------------
     def _compute_accel(self, positions, rotations):
         """World-frame acceleration via central differences → sensor frame."""
         N = len(positions)
@@ -78,10 +57,8 @@ class IMUSimulator:
     def _compute_gyro(self, rotations):
         """Angular velocity in sensor (body) frame from consecutive rotations.
 
-        A real gyroscope returns ω expressed in the sensor's own frame, i.e.
-        the right-multiplicative increment R[i+1] = R[i] · exp([ω_body·dt]×).
-        Using the world-frame increment (R[i+1] · R[i]^T) was wrong and made
-        any downstream filter integrate rotation as if R[i] = I.
+        ω is in the body frame: the right-multiplicative increment
+        R[i+1] = R[i] · exp([ω_body·dt]×), NOT the world-frame R[i+1]·R[i]^T.
         """
         N = len(rotations)
         gyro = np.zeros((N, 3))
@@ -92,9 +69,6 @@ class IMUSimulator:
             gyro[-1] = gyro[-2]
         return gyro
 
-    # ------------------------------------------------------------------
-    # noise model
-    # ------------------------------------------------------------------
     def _add_noise(self, signal, white_std, bias_std):
         """White noise + random-walk bias drift + per-axis scale error."""
         N, D = signal.shape
@@ -106,17 +80,8 @@ class IMUSimulator:
 
         return signal * scale_err + white + bias
 
-    # ------------------------------------------------------------------
-    # public API
-    # ------------------------------------------------------------------
     def generate(self, tforms, add_noise=True):
-        """
-        Args:
-            tforms:    [N, 4, 4] homogeneous transformation matrices
-            add_noise: False → clean signal (useful for debugging)
-        Returns:
-            [N, 6] float32 — [accel_x, accel_y, accel_z, gyro_x, gyro_y, gyro_z]
-        """
+        """[N,4,4] transforms -> [N,6] float32 [accel_xyz, gyro_xyz]. add_noise=False = clean."""
         positions = tforms[:, :3, 3].astype(np.float64)
         rotations = tforms[:, :3, :3].astype(np.float64)
 

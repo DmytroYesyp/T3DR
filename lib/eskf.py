@@ -1,24 +1,14 @@
-"""
-Loosely-coupled 15-state Error-State Kalman Filter for trackerless
+"""Loosely-coupled 15-state Error-State Kalman Filter for trackerless
 ultrasound probe tracking.
 
-The ESKF runs IMU dead-reckoning between visual frames and accepts
-signed Δz measurements from the visual model at frame rate. Online
-estimation of accelerometer and gyroscope biases keeps long-term
-drift bounded — the previous open-loop double-integration cannot do
-this and is what made the linear-α verifier marginal.
+Runs IMU dead-reckoning between visual frames and accepts signed Δz
+measurements at frame rate. Online accel/gyro bias estimation keeps
+long-term drift bounded.
 
-State (16 nominal):
-    p ∈ R³        position
-    v ∈ R³        velocity
-    R ∈ SO(3)     sensor→world orientation (3×3 matrix)
-    b_a ∈ R³      accelerometer bias
-    b_g ∈ R³      gyroscope bias
-
-Error state (15):
-    [δp, δv, δθ, δb_a, δb_g]
-δθ ∈ R³ is a small rotation in the so(3) tangent space; avoids the
-redundancy of carrying a quaternion inside the covariance.
+Nominal state: p (position), v (velocity), R ∈ SO(3) sensor→world,
+b_a (accel bias), b_g (gyro bias).
+Error state (15): [δp, δv, δθ, δb_a, δb_g], with δθ ∈ R³ a small rotation
+in the so(3) tangent space (avoids carrying a quaternion in the covariance).
 """
 
 import numpy as np
@@ -65,9 +55,8 @@ class ESKF:
 
     def reset(self, position=None, rotation=None, velocity=None):
         self.p = np.zeros(3) if position is None else np.asarray(position, dtype=np.float64).copy()
-        # Bootstrap v from the visual model's first prediction so the IMU's
-        # first sign decision isn't dominated by accel noise (the original
-        # coin-flip failure mode).
+        # Bootstrap v from the visual model's first prediction so the first sign
+        # decision isn't dominated by accel noise.
         self.v = np.zeros(3) if velocity is None else np.asarray(velocity, dtype=np.float64).copy()
         self.R = np.eye(3) if rotation is None else np.asarray(rotation, dtype=np.float64).copy()
         self.b_a = np.zeros(3)
@@ -95,14 +84,11 @@ class ESKF:
         self.P = F @ self.P @ F.T + self.Q
 
     def update_dz(self, dz_visual, sigma):
-        """
-        Signed Δz measurement update against the last committed anchor.
-        The visual model now predicts a signed scalar directly. Earlier
-        attempts at sign-from-IMU were unreliable: over a 33 ms frame the
-        accel/gyro noise dominates any real velocity signal, so the first
-        1–2 frames effectively coin-flipped trajectory direction and the
-        ESKF velocity state then locked it in. With proper σ the bias
-        states absorb persistent IMU drift over time.
+        """Signed Δz measurement update against the last committed anchor.
+
+        The visual model supplies the signed scalar directly (sign-from-IMU is
+        unreliable: over a 33 ms frame accel/gyro noise dominates the velocity
+        signal). The bias states absorb persistent IMU drift over time.
         """
         dz_pred = float(self.p[2] - self.p_anchor[2])
         z_signed = float(dz_visual)

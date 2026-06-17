@@ -25,9 +25,7 @@ from lib.imu_simulator import IMUSimulator
 from lib.imu_verifier import IMUVerifier
 from lib.complementary_filter import ComplementaryFilter
 
-# =============================================================================
-# CONFIG
-# =============================================================================
+# --- CONFIG ---
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 SEQ_LEN = 20
 BATCH_SIZE = 164
@@ -57,9 +55,7 @@ VAL_TFORMS_ROOT = os.path.join(BASE_DATA_DIR, 'valDataset/data/transfs')
 VAL_LAST_N = 10  # legacy: last N pairs alphabetically (monovariate)
 VAL_PER_SUBJECT = 4  # stratified: N scans per validation subject
 
-# =============================================================================
-# UTILITIES
-# =============================================================================
+# --- UTILITIES ---
 def get_time():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -142,9 +138,7 @@ def load_weights_safe(model, path):
     model.eval()
     return model
 
-# =============================================================================
-# LOSS
-# =============================================================================
+# --- LOSS ---
 class MotionWeightedL1Loss(nn.Module):
     def __init__(self, alpha=2.0):
         super().__init__()
@@ -205,9 +199,7 @@ class MotionWeightedTwoHeadLoss(nn.Module):
         return mag_loss + self.sign_weight * sign_loss, mag_loss, sign_loss
 
 
-# =============================================================================
-# DATASETS
-# =============================================================================
+# --- DATASETS ---
 class LargeUSDataset(Dataset):
     def __init__(self, root_dirs, seq_len=5, use_imu=False, augment=False):
         self.samples = []
@@ -329,9 +321,7 @@ class MemoryUSDataset(Dataset):
 
         return seq_tensor, target
 
-# =============================================================================
-# TRAINING
-# =============================================================================
+# --- TRAINING ---
 def train_model(run_name, run_dir, model_name, model, train_loader, val_loader, epochs, use_imu=False):
     print(f"\n{'='*50}")
     print(f"[{get_time()}] INITIALIZING TRAINING FOR: {model_name}")
@@ -497,7 +487,6 @@ def train_model(run_name, run_dir, model_name, model, train_loader, val_loader, 
             torch.save(model.state_dict(), best_model_path)
             print(f"[{get_time()}] Best {model_name} saved as {best_model_path} (val MAE {avg_mae:.4f} mm).")
 
-    # Training curve plot
     plt.figure(figsize=(10, 5))
     plt.plot(history['train'], label='Train Loss (Weighted)', color='blue', linewidth=2)
     plt.plot(history['val'], label='Validation Loss (Weighted)', color='orange', linewidth=2)
@@ -514,9 +503,7 @@ def train_model(run_name, run_dir, model_name, model, train_loader, val_loader, 
 
     return history, best_model_path
 
-# =============================================================================
-# EVALUATION
-# =============================================================================
+# --- EVALUATION ---
 def calculate_metrics(z_pred, z_real):
     mae = np.mean(np.abs(z_pred - z_real))
     final_drift = abs(z_pred[-1] - z_real[-1])
@@ -891,9 +878,7 @@ def run_evaluation(run_name, run_dir, val_dir, model, imu_verifier, val_pairs,
 
     print(f"\n[{get_time()}] Evaluation complete.")
 
-# =============================================================================
-# MAIN
-# =============================================================================
+# --- MAIN ---
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='FiMA-Net training + IMU-verified evaluation')
     parser.add_argument('--name', '-n', default=None,

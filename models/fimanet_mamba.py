@@ -89,7 +89,7 @@ class FiMANetMamba(nn.Module):
             )
 
         self.pos_encoder = PositionalEncoding(hidden_size, max_len=seq_len)
-        # Mamba S6 block (Gu & Dao 2023) replacing the hand-rolled TemporalSSMBlock.
+        # Mamba S6 block (Gu & Dao 2023).
         self.temporal_layers = nn.ModuleList([
             Mamba(d_model=hidden_size, d_state=mamba_d_state,
                   d_conv=mamba_d_conv, expand=mamba_expand)

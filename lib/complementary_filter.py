@@ -1,26 +1,14 @@
-"""
-Position-level complementary filter for visual + inertial fusion.
+"""Position-level complementary filter: a simple classical baseline for the ESKF.
 
-Intentionally simpler than the ESKF — provides a fair "classical" baseline
-to compare the error-state filter against in the thesis. The complementary
-filter blends two velocity estimates each frame:
-
+Blends an IMU and a visual velocity estimate each frame:
     v_imu = v_prev + (accel_z_world - gravity) * dt
     v_vis = z_visual / dt
-    v     = α · v_imu + (1 − α) · v_vis
-    p     = p_prev + v · dt
+    v     = α·v_imu + (1-α)·v_vis,   p = p_prev + v·dt
 
-Compared to the ESKF this drops:
-  • online accel/gyro bias estimation
-  • full rotation tracking (so accel_z is taken in the sensor frame, which
-    is approximately world-z only when the probe is held near-vertical)
-  • per-frame covariance update and adaptive Kalman gain
-
-α is a fixed scalar — α=0 is pure visual sum, α=1 is pure IMU dead-reckoning.
-Typical α ∈ [0.05, 0.3]; lower values trust the visual model more.
-
-Drop-in API match with lib.imu_verifier.IMUVerifier so it slots into the
-same inference loop unchanged.
+No bias estimation, no rotation tracking (accel_z taken in the sensor frame ≈
+world-z only when the probe is near-vertical), no covariance. α=0 is pure
+visual, α=1 is pure IMU; typical α ∈ [0.05, 0.3], lower trusts vision more.
+Drop-in API match with lib.imu_verifier.IMUVerifier.
 """
 
 import numpy as np
@@ -36,8 +24,7 @@ class ComplementaryFilter:
         self.v = 0.0
 
     def reset(self, init_position, init_rotation=None, init_velocity=None):
-        # init_rotation accepted for API compatibility with IMUVerifier; the
-        # complementary filter has no rotation state so it's ignored.
+        # init_rotation ignored (no rotation state); kept for IMUVerifier API parity.
         if hasattr(init_position, '__len__'):
             self.p = float(init_position[2])
         else:
@@ -60,9 +47,7 @@ class ComplementaryFilter:
         z_visual: signed Δz prediction from the visual model.
         sigma_visual: ignored (filter uses fixed α blending).
         """
-        # Approx world-z acceleration: assume probe sensor z ≈ world z, so
-        # subtract gravity magnitude directly. Inaccurate under large probe
-        # tilt — this is the cost of being a "simple" filter vs the ESKF.
+        # Assume sensor z ≈ world z and subtract gravity directly; inaccurate under tilt.
         accel_z_world = float(accel[2]) - self.gravity
 
         z_before = self.p

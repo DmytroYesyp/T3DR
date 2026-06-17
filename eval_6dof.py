@@ -44,9 +44,7 @@ def get_time():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
-# ---------------------------------------------------------------------------
-# Calibration / geometry utilities (replicating baseline behavior)
-# ---------------------------------------------------------------------------
+# --- Calibration / geometry utilities (replicating baseline behavior) ---
 def read_calib_matrices(filename_calib):
     tform_calib = np.empty((8, 4), np.float32)
     with open(filename_calib, 'r') as f:
@@ -75,9 +73,7 @@ def reference_image_points(image_size=(IMG_H, IMG_W)):
     return pts  # (4, H*W)
 
 
-# ---------------------------------------------------------------------------
-# 6-DoF param ↔ 4x4 matrix conversion (scipy, ZYX Euler — matches baseline)
-# ---------------------------------------------------------------------------
+# --- Checkpoint introspection + 6-DoF param ↔ 4x4 conversion (scipy, ZYX Euler) ---
 def infer_pool_size(state_dict, backbone):
     """Recover the pool grid from fusion.0.weight so old (2x2) and new ckpts both load."""
     chsum = 3584 if backbone == 'resnet50' else 896  # R18/R34: 128+256+512
@@ -157,9 +153,7 @@ def accumulate_global(locals_4x4):
     return out
 
 
-# ---------------------------------------------------------------------------
-# DDF computation (matches baseline.Transf2DDFs)
-# ---------------------------------------------------------------------------
+# --- DDF computation (matches baseline.Transf2DDFs) ---
 def cal_allpts_DDF(transformations, pixel_to_image_mm, image_points):
     """transformations: (N, 4, 4) numpy.
     image_points: (4, P) numpy (pixel coords, homogeneous).
@@ -192,9 +186,7 @@ def cal_dist(label, pred, mode='all'):
     raise ValueError(mode)
 
 
-# ---------------------------------------------------------------------------
-# Model inference
-# ---------------------------------------------------------------------------
+# --- Model inference ---
 LOSS_START_POS = 5   # positions below this were masked from the training loss
 WINDOW_FRAME_CAP = 960  # frames per forward pass; window batch = cap // seq_len (avoids OOM at long windows)
 
@@ -309,9 +301,7 @@ def predict_global_local_matrices(models, frames, seq_lens, fullscan=False,
     return global_mats, local_mats, local_params
 
 
-# ---------------------------------------------------------------------------
-# Lucas-Kanade (hybrid mode): compute (tx_mm, ty_mm) per consecutive frame pair
-# ---------------------------------------------------------------------------
+# --- Lucas-Kanade (hybrid mode): (tx_mm, ty_mm) per consecutive frame pair ---
 _LK_FEATURE_PARAMS = dict(maxCorners=200, qualityLevel=0.01, minDistance=7, blockSize=7)
 _LK_PARAMS = dict(winSize=(21, 21), maxLevel=3,
                   criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01))
@@ -379,9 +369,7 @@ def build_hybrid_local_mats(model_local_params, lk_tx_ty, model_local_mats):
     return out
 
 
-# ---------------------------------------------------------------------------
-# Landmark loader
-# ---------------------------------------------------------------------------
+# --- Landmark loader ---
 def load_landmarks(landmark_root, subject_str, scan_name_no_ext):
     """Returns landmarks shape (20, 3) — (frame_idx, x, y), 1-based frame_idx."""
     # subject_str is like "050"; landmark file is landmark_050.h5
@@ -394,9 +382,7 @@ def load_landmarks(landmark_root, subject_str, scan_name_no_ext):
         return np.array(f[scan_name_no_ext])
 
 
-# ---------------------------------------------------------------------------
-# Val file discovery
-# ---------------------------------------------------------------------------
+# --- Val file discovery ---
 def collect_val_files(n_per_subject=24):
     pairs = []
     if not os.path.isdir(VAL_FRAMES_ROOT):
@@ -416,9 +402,7 @@ def collect_val_files(n_per_subject=24):
     return pairs
 
 
-# ---------------------------------------------------------------------------
-# Main eval
-# ---------------------------------------------------------------------------
+# --- Main eval ---
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--ckpt', required=True, nargs='+',
@@ -437,12 +421,17 @@ def main():
     parser.add_argument('--reverse-tta', action='store_true',
                         help="Also predict the reversed scan, map back, and average (cancels "
                              "direction-coherent tz bias).")
+    parser.add_argument('--dump-trajectories', default=None,
+                        help="Directory to write per-scan pred/GT global corner trajectories + "
+                             "per-frame GPE (.npz per scan), for figure regeneration.")
     args = parser.parse_args()
     do_pure = args.mode in ('pure', 'both')
     do_hybrid = args.mode in ('hybrid', 'both')
 
     out_dir = args.out_dir or os.path.dirname(args.ckpt[0])
     os.makedirs(out_dir, exist_ok=True)
+    if args.dump_trajectories:
+        os.makedirs(args.dump_trajectories, exist_ok=True)
     tag = args.mode
     if args.fullscan:        tag += '_fullscan'
     if args.avg_window:      tag += '_avgwin'
@@ -542,6 +531,7 @@ def main():
         log_parts = [f"{idx+1}/{len(val_files)} {scan_label}"]
         if do_pure:
             gpe, gle, lpe, lle = _compute(pure_global, pure_local)
+            pure_gpe = gpe
             metrics['pure']['gpe'].append(gpe);  metrics['pure']['lpe'].append(lpe)
             if not np.isnan(gle): metrics['pure']['gle'].append(gle)
             if not np.isnan(lle): metrics['pure']['lle'].append(lle)
@@ -555,6 +545,21 @@ def main():
             row += [gpe, gle, lpe, lle, n_lk_fail]
             log_parts.append(f"HYB  GPE={gpe:.2f} GLE={gle:.2f} (LK fail {n_lk_fail})")
         rows.append(row)
+
+        # Per-scan trajectory dump for figure regeneration (pure model only).
+        if args.dump_trajectories and do_pure:
+            cpx = np.array([[1, 1, 0, 1], [IMG_W, 1, 0, 1],
+                            [1, IMG_H, 0, 1], [IMG_W, IMG_H, 0, 1]], dtype=np.float32).T  # (4,4) cols=corners
+            cmm = pixel_to_image_mm @ cpx                                    # 4 image corners in image_mm
+            pred_c = np.einsum('nij,jp->nip', pure_global, cmm)[:, :3, :]    # (N,3,4) positions in frame_0
+            gt_c   = np.einsum('nij,jp->nip', gt_global,  cmm)[:, :3, :]
+            pred_gp_all = cal_allpts_DDF(pure_global, pixel_to_image_mm, image_points)
+            pf_gpe = np.sqrt(((gt_gp - pred_gp_all) ** 2).sum(1)).mean(1)    # (N,) per-frame GPE, all pixels
+            np.savez(os.path.join(args.dump_trajectories, f"{subj}_{scan_no_ext}.npz"),
+                     scan=scan_label, pred_corners=pred_c.astype(np.float32),
+                     gt_corners=gt_c.astype(np.float32),
+                     per_frame_gpe=pf_gpe.astype(np.float32), scan_gpe=np.float32(pure_gpe))
+
         print(f"[{get_time()}] " + " | ".join(log_parts))
 
     # CSV
