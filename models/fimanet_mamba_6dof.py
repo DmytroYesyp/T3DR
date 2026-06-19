@@ -72,6 +72,21 @@ class CorrEncoder(nn.Module):
         return self.proj(self.enc(cv).flatten(1))  # [N, out_dim]
 
 
+class SpatialSSM(nn.Module):
+    """Bidirectional Mamba over the flattened spatial map, mean-pooled per frame (ReMamba idea)."""
+    def __init__(self, in_ch, d_model, d_state=16, d_conv=4, expand=2):
+        super().__init__()
+        self.proj_in = nn.Linear(in_ch, d_model)
+        self.norm = nn.LayerNorm(d_model)
+        self.fwd = Mamba(d_model=d_model, d_state=d_state, d_conv=d_conv, expand=expand)
+        self.bwd = Mamba(d_model=d_model, d_state=d_state, d_conv=d_conv, expand=expand)
+
+    def forward(self, x):  # x: [N, T, in_ch]
+        x = self.norm(self.proj_in(x))
+        y = self.fwd(x) + self.bwd(x.flip(1)).flip(1)
+        return y.mean(dim=1)  # [N, d_model]
+
+
 class FiMANetMamba6DOF(nn.Module):
     """6-DoF variant of FiMANetMamba.
 
@@ -85,7 +100,7 @@ class FiMANetMamba6DOF(nn.Module):
                  pair_encoder=True, pair_strides=(1,),
                  mamba_d_state=16, mamba_d_conv=4, mamba_expand=2,
                  backbone='resnet18', pool_size=2, freeze_early=True, bidirectional=False,
-                 use_corr=False, corr_disp=4, corr_dim=128):
+                 use_corr=False, corr_disp=4, corr_dim=128, use_spatial_ssm=False):
         super().__init__()
         self.seq_len = seq_len
         self.pair_encoder = pair_encoder
@@ -145,6 +160,15 @@ class FiMANetMamba6DOF(nn.Module):
         if use_corr:
             self.corr_encoder = CorrEncoder(max_disp=corr_disp, out_dim=corr_dim)
 
+        # Spatial-scan SSM over layer-3, fused with the pooled feature; per-frame dim stays
+        # hidden_size so pair_proj is unchanged and old checkpoints still load.
+        self.use_spatial_ssm = use_spatial_ssm
+        if use_spatial_ssm:
+            self.spatial_ssm = SpatialSSM(ch3, hidden_size, mamba_d_state, mamba_d_conv, mamba_expand)
+            self.combine_proj = nn.Sequential(
+                nn.Linear(hidden_size * 2, hidden_size), nn.LayerNorm(hidden_size),
+                nn.ReLU(), nn.Dropout(0.2))
+
         if pair_encoder:
             in_dim = hidden_size * (1 + len(self.pair_strides))
             if use_corr:
@@ -184,6 +208,11 @@ class FiMANetMamba6DOF(nn.Module):
         p3 = self.pool(f3).flatten(1)
         p4 = self.pool(f4).flatten(1)
         features = self.fusion(torch.cat([p2, p3, p4], dim=1)).view(b, s, -1)
+
+        if self.use_spatial_ssm:
+            spat = f3.flatten(2).transpose(1, 2)              # [b*s, H3*W3, ch3]
+            spat = self.spatial_ssm(spat).view(b, s, -1)      # [b, s, hidden]
+            features = self.combine_proj(torch.cat([features, spat], dim=-1))
 
         if self.pair_encoder:
             S = features.shape[1]

@@ -18,18 +18,17 @@ from models.fimanet_mamba_6dof import FiMANetMamba6DOF
 
 # --- CONFIG ---
 DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-# Tier-2: warm-start bidir + add an adjacent-frame correlation volume (speckle/out-of-plane cue).
-# Backbone frozen for WARMUP_EPOCHS so the new corr + pair_proj learn before the backbone moves.
+# Tier-3 spatial-scan SSM: warm-start bidir + a per-frame Mamba over the layer-3 map (ReMamba idea).
 SEQ_LEN_MIN, SEQ_LEN_MAX = 60, 60
 SEQ_LEN = SEQ_LEN_MAX                 # PE buffer + val/proxy window length
 FRAME_INTERVALS = (1,)
-BATCH_SIZE = 8                        # 8 x 60 = 480 frames + corr-volume overhead
+BATCH_SIZE = 8                        # 8 x 60 = 480 frames
 GRAD_ACCUM = 2                        # effective batch 16
-WINDOW_STRIDE = 4
-EPOCHS = 14
-WARMUP_EPOCHS = 3                     # backbone frozen while the new corr module learns
+WINDOW_STRIDE = 12                    # ~45k seqs/epoch
+EPOCHS = 7
+WARMUP_EPOCHS = 2                     # backbone frozen while spatial_ssm + combine_proj learn
 LR_BACKBONE = 1e-5
-LR_HEAD = 1e-4                        # corr_encoder + pair_proj train from scratch
+LR_HEAD = 1e-4                        # spatial_ssm + combine_proj train from scratch
 PAIR_STRIDES = (1,)
 BACKBONE = os.environ.get("BACKBONE", "resnet18")  # resnet18 | resnet34 | resnet50
 
@@ -40,7 +39,8 @@ W_PEARSON = 0.5   # case-wise Pearson on 6-DoF trajectory (FiMoNet)
 POOL_SIZE    = 7
 FREEZE_EARLY = False
 BIDIRECTIONAL = True
-USE_CORR  = True      # Tier-2 adjacent-frame correlation volume
+USE_CORR  = False
+USE_SPATIAL_SSM = True   # Tier-3 spatial-scan SSM over the layer-3 map
 CORR_DISP = 4
 CORR_DIM  = 128
 ZREVERSE_P = 0.12     # frame-reversal aug; targets recomputed from reversed poses
@@ -524,6 +524,8 @@ def train_model(run_name, run_dir, model, train_loader, val_loader, epochs, imag
         head_params += list(model.pair_proj.parameters())
     if getattr(model, 'use_corr', False):
         head_params += list(model.corr_encoder.parameters())
+    if getattr(model, 'use_spatial_ssm', False):
+        head_params += list(model.spatial_ssm.parameters()) + list(model.combine_proj.parameters())
 
     optimizer = torch.optim.Adam([
         {'params': backbone_params, 'lr': LR_BACKBONE},
@@ -680,20 +682,18 @@ if __name__ == '__main__':
     model = FiMANetMamba6DOF(seq_len=SEQ_LEN_MAX, pair_encoder=True, pair_strides=PAIR_STRIDES,
                               backbone=BACKBONE, pool_size=POOL_SIZE, freeze_early=FREEZE_EARLY,
                               bidirectional=BIDIRECTIONAL, use_corr=USE_CORR,
-                              corr_disp=CORR_DISP, corr_dim=CORR_DIM)
+                              corr_disp=CORR_DISP, corr_dim=CORR_DIM, use_spatial_ssm=USE_SPATIAL_SSM)
     if args.init_ckpt:
         sd = torch.load(args.init_ckpt, map_location='cpu')
         sd = sd['model_state_dict'] if isinstance(sd, dict) and 'model_state_dict' in sd else sd
         sd.pop('pos_encoder.pe', None)  # length-dependent buffer; model rebuilds it for SEQ_LEN
-        for k in [k for k in sd if k.startswith('pair_proj')]:  # in_dim grows with the corr feature
-            sd.pop(k)
-        missing, unexpected = model.load_state_dict(sd, strict=False)  # corr_encoder + pair_proj train fresh
+        missing, unexpected = model.load_state_dict(sd, strict=False)  # spatial_ssm + combine_proj train fresh
         print(f"[{get_time()}] Warm-start from {args.init_ckpt} | missing={missing} unexpected={unexpected}")
     n_params = sum(p.numel() for p in model.parameters())
     n_train = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"[{get_time()}] Total params: {n_params/1e6:.1f}M ({n_train/1e6:.1f}M trainable) | "
           f"seq={SEQ_LEN_MIN}-{SEQ_LEN_MAX} interval={FRAME_INTERVALS} stride={WINDOW_STRIDE} "
-          f"batch={BATCH_SIZE}x{GRAD_ACCUM}accum bidir={BIDIRECTIONAL} corr={USE_CORR}(d{CORR_DISP}) "
+          f"batch={BATCH_SIZE}x{GRAD_ACCUM}accum bidir={BIDIRECTIONAL} corr={USE_CORR} spatial_ssm={USE_SPATIAL_SSM} "
           f"pool={POOL_SIZE}x{POOL_SIZE} freeze_early={FREEZE_EARLY} | "
           f"loss: point + {W_GLOBAL}*global + {W_PEARSON}*pearson | "
           f"zrev_p={ZREVERSE_P} | sliding avg-window proxy")

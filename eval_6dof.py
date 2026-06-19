@@ -107,6 +107,11 @@ def infer_corr(state_dict):
     return True, disp, int(w_proj.shape[0])
 
 
+def infer_spatial_ssm(state_dict):
+    """Tier-3 spatial-scan SSM checkpoints have spatial_ssm.* submodules."""
+    return any(k.startswith('spatial_ssm.') for k in state_dict)
+
+
 def params_to_matrix(params):
     """params: (6,) array (rz, ry, rx, tx, ty, tz). Returns (4, 4) image_mm transform."""
     rz, ry, rx, tx, ty, tz = params
@@ -452,12 +457,13 @@ def main():
         seq_len = infer_seq_len(state_dict)
         bidirectional = infer_bidirectional(state_dict)
         use_corr, corr_disp, corr_dim = infer_corr(state_dict)
+        use_spatial = infer_spatial_ssm(state_dict)
         print(f"[{get_time()}] Inferred from ckpt: pool_size={pool_size} seq_len={seq_len} "
-              f"bidirectional={bidirectional} use_corr={use_corr}(d{corr_disp})")
+              f"bidirectional={bidirectional} use_corr={use_corr}(d{corr_disp}) spatial_ssm={use_spatial}")
         model = FiMANetMamba6DOF(seq_len=seq_len, pair_encoder=True, pair_strides=PAIR_STRIDES,
                                   backbone=args.backbone, pool_size=pool_size,
                                   bidirectional=bidirectional, use_corr=use_corr,
-                                  corr_disp=corr_disp, corr_dim=corr_dim).to(DEVICE)
+                                  corr_disp=corr_disp, corr_dim=corr_dim, use_spatial_ssm=use_spatial).to(DEVICE)
         model.load_state_dict(state_dict)
         model.eval()
         models.append(model)
