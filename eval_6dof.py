@@ -429,7 +429,13 @@ def main():
     parser.add_argument('--dump-trajectories', default=None,
                         help="Directory to write per-scan pred/GT global corner trajectories + "
                              "per-frame GPE (.npz per scan), for figure regeneration.")
+    parser.add_argument('--infer-res', type=int, nargs=2, default=None, metavar=('H', 'W'),
+                        help="Network input resolution H W; MUST match training (default 240 320).")
     args = parser.parse_args()
+    if args.infer_res:
+        global INFER_H, INFER_W
+        INFER_H, INFER_W = args.infer_res
+        print(f"[{get_time()}] Inference resolution override: {INFER_H}x{INFER_W}")
     do_pure = args.mode in ('pure', 'both')
     do_hybrid = args.mode in ('hybrid', 'both')
 

@@ -18,17 +18,17 @@ from models.fimanet_mamba_6dof import FiMANetMamba6DOF
 
 # --- CONFIG ---
 DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-# Tier-3 spatial-scan SSM: warm-start bidir + a per-frame Mamba over the layer-3 map (ReMamba idea).
+# Tier-4 high-res fine-tune: warm-start bidir at 360x480 (finer speckle detail; the untested LPE lever).
 SEQ_LEN_MIN, SEQ_LEN_MAX = 60, 60
 SEQ_LEN = SEQ_LEN_MAX                 # PE buffer + val/proxy window length
 FRAME_INTERVALS = (1,)
-BATCH_SIZE = 8                        # 8 x 60 = 480 frames
-GRAD_ACCUM = 2                        # effective batch 16
-WINDOW_STRIDE = 12                    # ~45k seqs/epoch
-EPOCHS = 7
-WARMUP_EPOCHS = 2                     # backbone frozen while spatial_ssm + combine_proj learn
+BATCH_SIZE = 4                        # 4 x 60 @ 360x480 ~= 240x320 batch-8 footprint
+GRAD_ACCUM = 4                        # effective batch 16
+WINDOW_STRIDE = 16                    # ~34k seqs/epoch
+EPOCHS = 6                            # hard cap (one night)
+WARMUP_EPOCHS = 0                     # full warm-start, no freeze
 LR_BACKBONE = 1e-5
-LR_HEAD = 1e-4                        # spatial_ssm + combine_proj train from scratch
+LR_HEAD = 3e-5                        # gentle fine-tune
 PAIR_STRIDES = (1,)
 BACKBONE = os.environ.get("BACKBONE", "resnet18")  # resnet18 | resnet34 | resnet50
 
@@ -40,7 +40,7 @@ POOL_SIZE    = 7
 FREEZE_EARLY = False
 BIDIRECTIONAL = True
 USE_CORR  = False
-USE_SPATIAL_SSM = True   # Tier-3 spatial-scan SSM over the layer-3 map
+USE_SPATIAL_SSM = False
 CORR_DISP = 4
 CORR_DIM  = 128
 ZREVERSE_P = 0.12     # frame-reversal aug; targets recomputed from reversed poses
@@ -50,8 +50,8 @@ GPE_PROXY_SCANS = 6   # full val scans for the per-epoch GPE proxy
 IMG_H, IMG_W = 480, 640
 CORNER_DENSITY = 4  # 4x4 = 16 points (TUS-REC baseline)
 
-# Network input: half-res (FiMoNet 50% resize); GT/calib stay 480x640. eval_6dof INFER_H/W must match.
-NET_H, NET_W = 240, 320
+# Network input. GT/calib stay 480x640. eval_6dof must match (use --infer-res for non-default).
+NET_H, NET_W = 360, 480
 
 BASE_DATA_DIR = "/home/123ghdh/datasets"
 TRAIN_FOLDERS = [os.path.join(BASE_DATA_DIR, str(i).zfill(3)) for i in range(50)]
@@ -658,7 +658,7 @@ if __name__ == '__main__':
                                          image_points_mm=image_points_mm)
                     for fp, tp, _ in val_pairs]
     val_ds = ConcatDataset(val_datasets)
-    val_loader = DataLoader(val_ds, batch_size=6, shuffle=False, num_workers=2, pin_memory=True)
+    val_loader = DataLoader(val_ds, batch_size=4, shuffle=False, num_workers=2, pin_memory=True)
 
     # full val scans for the per-epoch GPE proxy
     proxy_scans = []
