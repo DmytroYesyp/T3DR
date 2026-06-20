@@ -196,11 +196,12 @@ LOSS_START_POS = 5   # positions below this were masked from the training loss
 WINDOW_FRAME_CAP = 960  # frames per forward pass; window batch = cap // seq_len (avoids OOM at long windows)
 
 
-def _resize_frames(frames):
+def _resize_frames(frames, hw=None):
+    H, W = hw if hw is not None else (INFER_H, INFER_W)
     N = len(frames)
-    resized = np.zeros((N, 1, INFER_H, INFER_W), dtype=np.float32)
+    resized = np.zeros((N, 1, H, W), dtype=np.float32)
     for i in range(N):
-        img = cv2.resize(frames[i], (INFER_W, INFER_H))
+        img = cv2.resize(frames[i], (W, H))
         if img.max() > 1.0:
             img = img / 255.0
         resized[i, 0] = img.astype(np.float32)
@@ -290,14 +291,18 @@ def predict_params_one(model, resized, seq_len, fullscan=False, avg_window=False
     return ((fwd + invert_params_seq(rev[::-1])) / 2.0).astype(np.float32)
 
 
-def predict_global_local_matrices(models, frames, seq_lens, fullscan=False,
+def predict_global_local_matrices(models, frames, seq_lens, model_res, fullscan=False,
                                   avg_window=False, reverse_tta=False):
-    """Ensemble-mean local params across models -> (global, local, params) matrices
-    in the image_mm coordinate system."""
+    """Ensemble-mean local params across models -> (global, local, params) matrices in the
+    image_mm frame. Each model is fed frames at its own training resolution (model_res[i]),
+    cached so same-resolution models share one resize (cross-resolution ensemble)."""
     N = len(frames)
-    resized = _resize_frames(frames)
-    all_params = [predict_params_one(m, resized, sl, fullscan, avg_window, reverse_tta)
-                  for m, sl in zip(models, seq_lens)]
+    cache = {}
+    all_params = []
+    for m, sl, hw in zip(models, seq_lens, model_res):
+        if hw not in cache:
+            cache[hw] = _resize_frames(frames, hw)
+        all_params.append(predict_params_one(m, cache[hw], sl, fullscan, avg_window, reverse_tta))
     local_params = np.mean(all_params, axis=0).astype(np.float32)
     local_mats = np.zeros((N - 1, 4, 4), dtype=np.float32)
     for i in range(N - 1):
@@ -431,6 +436,9 @@ def main():
                              "per-frame GPE (.npz per scan), for figure regeneration.")
     parser.add_argument('--infer-res', type=int, nargs=2, default=None, metavar=('H', 'W'),
                         help="Network input resolution H W; MUST match training (default 240 320).")
+    parser.add_argument('--ckpt-res', nargs='+', default=None, metavar='HxW',
+                        help="Per-checkpoint resolution (e.g. 240x320 360x480), parallel to --ckpt, "
+                             "for cross-resolution ensembles. Default: all use --infer-res.")
     args = parser.parse_args()
     if args.infer_res:
         global INFER_H, INFER_W
@@ -475,12 +483,20 @@ def main():
         models.append(model)
         seq_lens.append(seq_len)
 
+    if args.ckpt_res:
+        if len(args.ckpt_res) != len(args.ckpt):
+            raise SystemExit("--ckpt-res must give one HxW per --ckpt")
+        model_res = [tuple(int(x) for x in r.lower().split('x')) for r in args.ckpt_res]
+    else:
+        model_res = [(INFER_H, INFER_W)] * len(models)
+
     val_files = collect_val_files()
     if args.limit:
         val_files = val_files[:args.limit]
     print(f"[{get_time()}] Eval set: {len(val_files)} scans | "
           f"inference={'FULL-SCAN' if args.fullscan else 'sliding-window'} | "
-          f"avg_window={args.avg_window} reverse_tta={args.reverse_tta} ensemble={len(models)}")
+          f"avg_window={args.avg_window} reverse_tta={args.reverse_tta} ensemble={len(models)} "
+          f"resolutions={model_res}")
 
     metrics = {
         'pure':   {'gpe': [], 'gle': [], 'lpe': [], 'lle': []},
@@ -500,7 +516,7 @@ def main():
 
         # Model inference once
         pure_global, pure_local, pure_local_params = predict_global_local_matrices(
-            models, frames, seq_lens, fullscan=args.fullscan,
+            models, frames, seq_lens, model_res, fullscan=args.fullscan,
             avg_window=args.avg_window, reverse_tta=args.reverse_tta)
 
         # GT once
