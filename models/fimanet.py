@@ -68,15 +68,13 @@ class FiMANet(nn.Module):
 
         self.stem = nn.Sequential(base_resnet.conv1, base_resnet.bn1, base_resnet.relu, base_resnet.maxpool)
         self.layer1 = base_resnet.layer1
-        self.layer2 = base_resnet.layer2  # 128
-        self.layer3 = base_resnet.layer3  # 256
-        self.layer4 = base_resnet.layer4  # 512
+        self.layer2 = base_resnet.layer2
+        self.layer3 = base_resnet.layer3
+        self.layer4 = base_resnet.layer4
 
-        # stem + layer1 stay frozen.
         for param in self.stem.parameters(): param.requires_grad = False
         for param in self.layer1.parameters(): param.requires_grad = False
 
-        # Pool each level to 2x2 → 4 patches.
         self.pool = nn.AdaptiveAvgPool2d((2, 2))
 
         # (128+256+512) * 4 = 3584
@@ -156,30 +154,25 @@ class FiMANet(nn.Module):
         p3 = self.pool(f3).flatten(1)
         p4 = self.pool(f4).flatten(1)
 
-        combined = torch.cat([p2, p3, p4], dim=1) # [B*S, 3584]
+        combined = torch.cat([p2, p3, p4], dim=1)
         features = self.fusion(combined)
         features = features.view(b, s, -1)
 
-        # Gated additive fusion with IMU.
         if self.use_imu and imu is not None:
-            imu_feat = self.imu_encoder(imu)              # [B, S, hidden]
-            gate = self.fusion_gate(
-                torch.cat([features, imu_feat], dim=-1)   # [B, S, 2*hidden]
-            )                                              # [B, S, hidden]
+            imu_feat = self.imu_encoder(imu)
+            gate = self.fusion_gate(torch.cat([features, imu_feat], dim=-1))
             features = features + gate * imu_feat
 
-        # Pair encoding: [f_p | Δ_s1 | Δ_s2 | ...], output length S - max_stride.
         if self.pair_encoder:
             S = features.shape[1]
             ms = self._pair_max_stride
-            L = S - ms                                          # output length
-            f_curr = features[:, :L, :]                         # [B, L, H]
+            L = S - ms
+            f_curr = features[:, :L, :]
             parts = [f_curr]
             for s in self.pair_strides:
-                f_far = features[:, s:s + L, :]                 # [B, L, H]
+                f_far = features[:, s:s + L, :]
                 parts.append(f_far - f_curr)
-            pair_features = torch.cat(parts, dim=-1)            # [B, L, (1+n)*H]
-            features = self.pair_proj(pair_features)            # [B, L, H]
+            features = self.pair_proj(torch.cat(parts, dim=-1))
 
         features = self.pos_encoder(features)
         for layer in self.temporal_layers:
@@ -187,19 +180,19 @@ class FiMANet(nn.Module):
 
         # Heads emit one prediction per temporal position; inference reads [:, -1].
         if self.predict_sign:
-            mag = self.head_mag(features)         # [B, S, output_dim]
-            sign_logit = self.head_sign(features) # [B, S, output_dim]
+            mag = self.head_mag(features)
+            sign_logit = self.head_sign(features)
             if self.output_dim == 1:
-                mag = mag.squeeze(-1)             # [B, S]
+                mag = mag.squeeze(-1)
                 sign_logit = sign_logit.squeeze(-1)
             return mag, sign_logit
 
-        out = self.head(features)                 # [B, S, output_dim*(1 or 2)]
+        out = self.head(features)
         if self.predict_uncertainty:
             mu = out[..., :self.output_dim]
             log_var = out[..., self.output_dim:]
             if self.output_dim == 1:
-                mu = mu.squeeze(-1)               # [B, S]
+                mu = mu.squeeze(-1)
                 log_var = log_var.squeeze(-1)
             return mu, log_var
         return out.squeeze(-1) if self.output_dim == 1 else out
